@@ -13,19 +13,18 @@ use led_matrix::LedMatrix;
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Framework Laptop 16 Pong Wars", long_about = None)]
 struct Args {
-    /// Enable dual LED matrix mode (requires two modules installed)
     #[arg(short = 'd', long = "dualmode")]
     dual_mode: bool,
 
-    /// Frames per second target (1-64 fps)
+    #[arg(short = 'b', long = "balls", num_args = 0..=1, default_missing_value = "2", value_parser = clap::value_parser!(u8).range(1..=20))]
+    balls: Option<u8>,
+
     #[arg(short = 's', long = "speed", default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
     speed: u8,
 
-    /// Brightness percentage (0-100)
-    #[arg(short = 'b', long = "brightness", default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
+    #[arg(short = 'B', long = "brightness", default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
     brightness: u8,
 
-    /// Enable additional debug logging
     #[arg(long = "debug")]
     debug: bool,
 }
@@ -60,7 +59,8 @@ fn main() -> Result<()> {
         SHUTDOWN.store(true, Ordering::SeqCst);
     })?;
 
-    run_game_loop(&mut matrix, effective_fps, brightness_atomic, args.debug)?;
+    let balls_per_team: u8 = args.balls.unwrap_or(1);
+    run_game_loop(&mut matrix, effective_fps, brightness_atomic, args.debug, balls_per_team)?;
 
     println!("Exited cleanly.");
     Ok(())
@@ -73,9 +73,10 @@ fn run_game_loop(
     target_fps: u8,
     brightness: Arc<AtomicU8>,
     debug: bool,
+    balls_per_team: u8,
 ) -> Result<()> {
     let width = matrix.width();
-    let mut game_state = GameState::new(width, DEFAULT_GRID_HEIGHT);
+    let mut game_state = GameState::new(width, DEFAULT_GRID_HEIGHT, balls_per_team);
 
     let frame_duration = Duration::from_secs_f64(1.0 / target_fps as f64);
     let mut next_frame_time = Instant::now();
