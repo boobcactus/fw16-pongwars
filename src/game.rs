@@ -40,14 +40,14 @@ pub struct GameState {
     width_f32: f32,
     height_f32: f32,
     pub squares: Vec<Vec<SquareColor>>,
-    pub balls: [Ball; 2],
+    pub balls: Vec<Ball>,
     pub day_score: usize,
     pub night_score: usize,
     pub rng: rand::rngs::ThreadRng,
 }
 
 impl GameState {
-    pub fn new(width: usize, height: usize) -> Self {
+    pub fn new(width: usize, height: usize, balls_per_team: u8) -> Self {
         assert!(width > 0, "width must be positive");
         assert!(height > 0, "height must be positive");
 
@@ -65,31 +65,38 @@ impl GameState {
         let mut rng = rand::thread_rng();
         let base_speed = 0.3;
         
-        let left_x = 2.0;
-        let right_x = width_f32 - 2.0;
         let top_y = 2.0;
         let bottom_y = height_f32 - 2.0;
 
         let jitter = std::f32::consts::PI / 6.0;
-        let day_angle = (top_y - bottom_y).atan2(right_x - left_x) + rng.gen_range(-jitter..jitter);
-        let night_angle = (bottom_y - top_y).atan2(left_x - right_x) + rng.gen_range(-jitter..jitter);
 
-        let balls = [
-            Ball::new(
-                left_x,
+        let n = balls_per_team.max(1) as usize;
+        let mut balls = Vec::with_capacity(n * 2);
+
+        for i in 0..n {
+            let frac = (i as f32 + 1.0) / (n as f32 + 1.0);
+            let x = 1.0 + frac * (width_f32 - 2.0);
+            let xn = width_f32 - x;
+
+            let day_angle = (top_y - bottom_y).atan2(xn - x) + rng.gen_range(-jitter..jitter);
+            let night_angle = (bottom_y - top_y).atan2(x - xn) + rng.gen_range(-jitter..jitter);
+
+            balls.push(Ball::new(
+                x,
                 bottom_y,
                 base_speed * day_angle.cos(),
                 base_speed * day_angle.sin(),
                 SquareColor::Day,
-            ),
-            Ball::new(
-                right_x,
+            ));
+
+            balls.push(Ball::new(
+                xn,
                 top_y,
                 base_speed * night_angle.cos(),
                 base_speed * night_angle.sin(),
                 SquareColor::Night,
-            ),
-        ];
+            ));
+        }
 
         let day_score = half_height * width;
         let night_score = half_height * width;
@@ -123,8 +130,8 @@ impl GameState {
         let mut day_score_delta = 0i32;
         let mut night_score_delta = 0i32;
 
-        let original_balls = self.balls;
-        let mut updated_balls = original_balls;
+        let original_balls = self.balls.clone();
+        let mut updated_balls = original_balls.clone();
 
         for (index, ball) in original_balls.iter().enumerate() {
             let mut ball_state = *ball;
