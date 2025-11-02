@@ -13,15 +13,14 @@ https://github.com/user-attachments/assets/2d7a4b85-f580-4dbc-9378-3473213b643f
 ## Example
 
 ```bash
-cargo run -- --dualmode --speed 48 --balls 4 --brightness 60
+cargo run -- --dualmode --speed 48 --balls 5 --brightness 10
 ```
 
 Flags
 
 - `-d`, `--dualmode`  Drive two modules side-by-side (18x34)
-- `-b`, `--balls [1-5]`  Balls per team. Defaults to 2 if no number is provided.
+- `-b`, `--balls [1-20]`  Balls per team. Defaults to 2 if no number is provided.
 - `-s`, `--speed <1-64>`  Target FPS (default 64)
-    - Supports up to 124 FPS by editing [this value](https://github.com/boobcactus/fw16-pong-wars/blob/b246b33519e5e006077fbc7d48cc27122e02981f/src/main.rs#L21), but may lead to instability in the EC.
 - `-B`, `--brightness <0-100>`  Brightness percent (default 50)
 - `--debug`  Extra timing/log output
 

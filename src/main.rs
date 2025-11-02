@@ -16,7 +16,7 @@ struct Args {
     #[arg(short = 'd', long = "dualmode")]
     dual_mode: bool,
 
-    #[arg(short = 'b', long = "balls", num_args = 0..=1, default_missing_value = "2", value_parser = clap::value_parser!(u8).range(1..=5))]
+    #[arg(short = 'b', long = "balls", num_args = 0..=1, default_missing_value = "2", value_parser = clap::value_parser!(u8).range(1..=20))]
     balls: Option<u8>,
 
     #[arg(short = 's', long = "speed", default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
