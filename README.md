@@ -1,7 +1,5 @@
    # FW16 Pong Wars
 
-A Rust app that plays Pong Wars on the Framework Laptop 16 LED Matrix.
-
 https://github.com/user-attachments/assets/2d7a4b85-f580-4dbc-9378-3473213b643f
 
 ## Requirements
