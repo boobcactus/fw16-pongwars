@@ -19,7 +19,7 @@ cargo run -- --dualmode --speed 48 --balls 5 --brightness 10
 Flags
 
 - `-d`, `--dualmode`  Drive two modules side-by-side (18x34)
-- `-b`, `--balls [1-20]`  Balls per team. Defaults to 2 if no number is provided.
+- `-b`, `--balls [1-20]`  Add more balls per team. Defaults to 2 if no number is provided. 
 - `-s`, `--speed <1-64>`  Target FPS (default 64)
 - `-B`, `--brightness <0-100>`  Brightness percent (default 50)
 - `--debug`  Extra timing/log output
