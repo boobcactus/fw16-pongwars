@@ -1,14 +1,14 @@
 use anyhow::{anyhow, Result};
 use serialport::{DataBits, Parity, SerialPort, StopBits};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::game::{GameState, SquareColor};
 
 const BAUD_RATE: u32 = 115200;
-const TIMEOUT_MS: u64 = 5000;
+const TIMEOUT_MS: u64 = 1000;
 
 // Framework LED Matrix Protocol Constants
 const MAGIC_WORD: [u8; 2] = [0x32, 0xAC];
@@ -16,50 +16,41 @@ const MAGIC_WORD: [u8; 2] = [0x32, 0xAC];
 // Command IDs
 const CMD_BRIGHTNESS: u8 = 0x00;
 const CMD_DRAW_BW: u8 = 0x06;
-const CMD_STAGE_GREY_COL: u8 = 0x07;
-const CMD_DRAW_GREY_BUFFER: u8 = 0x08;
-
-// Pre-calculated buffer sizes
-const COMMIT_CMD_SIZE: usize = 4; // Magic(2) + Cmd(1) + Unused(1)
 const MODULE_WIDTH: usize = 9;
 
 // Flow control constants
-const RECOVERY_DELAY_MS: u64 = 2000; // Delay after error before retry
-const MAX_CONSECUTIVE_ERRORS: u32 = 3; // Max errors before reset attempt
+const HEARTBEAT_INTERVAL: u64 = 64; // Frames between health checks (~1s at 64fps)
+const RECOVERY_INTERVAL_MS: u64 = 2000; // Minimum ms between reconnect attempts
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MatrixState {
+    Active,
+    Suspended,
+    Recovering,
+}
 
 struct MatrixPort {
     port: Box<dyn SerialPort>,
-    #[allow(dead_code)]
-    column_buffer: Vec<u8>,
-    #[allow(dead_code)]
-    commit_buffer: [u8; COMMIT_CMD_SIZE],
     width: usize,
-    #[allow(dead_code)]
-    last_columns: Vec<Vec<u8>>,
+    bw_buffer: [u8; 42],
 }
 
 impl MatrixPort {
-    #[allow(unused_mut)]
-    fn new(mut port: Box<dyn SerialPort>, height: usize) -> Result<Self> {
+    fn new(port: Box<dyn SerialPort>, _height: usize) -> Result<Self> {
         if let Err(e) = port.clear(serialport::ClearBuffer::All) {
             return Err(anyhow!("Failed clearing port: {}", e));
         }
         thread::sleep(Duration::from_millis(100));
 
-        let mut column_buffer = Vec::with_capacity(4 + height);
-        column_buffer.extend_from_slice(&MAGIC_WORD);
-        column_buffer.push(CMD_STAGE_GREY_COL);
-        column_buffer.push(0);
-        column_buffer.resize(4 + height, 0);
-
-        let commit_buffer = [MAGIC_WORD[0], MAGIC_WORD[1], CMD_DRAW_GREY_BUFFER, 0x00];
+        let mut bw_buffer = [0u8; 42];
+        bw_buffer[0] = MAGIC_WORD[0];
+        bw_buffer[1] = MAGIC_WORD[1];
+        bw_buffer[2] = CMD_DRAW_BW;
 
         Ok(MatrixPort {
             port,
-            column_buffer,
-            commit_buffer,
             width: MODULE_WIDTH,
-            last_columns: vec![vec![0xEE; height]; MODULE_WIDTH],
+            bw_buffer,
         })
     }
 }
@@ -67,7 +58,10 @@ impl MatrixPort {
 pub struct LedMatrix {
     ports: Vec<MatrixPort>,
     brightness: Arc<AtomicU8>,
-    consecutive_errors: u32,
+    state: MatrixState,
+    frame_count: u64,
+    last_recovery_attempt: Instant,
+    resume_flag: Arc<AtomicBool>,
     width: usize,
     height: usize,
 }
@@ -148,7 +142,10 @@ impl LedMatrix {
             height,
             ports: matrix_ports,
             brightness,
-            consecutive_errors: 0,
+            state: MatrixState::Active,
+            frame_count: 0,
+            last_recovery_attempt: Instant::now(),
+            resume_flag: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -156,18 +153,17 @@ impl LedMatrix {
         self.width
     }
 
-    pub fn reconnect(&mut self) -> Result<()> {
-        println!("Attempting to reconnect to LED Matrix...");
-        
-        thread::sleep(Duration::from_millis(RECOVERY_DELAY_MS));
+    pub fn resume_flag(&self) -> Arc<AtomicBool> {
+        self.resume_flag.clone()
+    }
 
+    fn try_reconnect(&mut self) -> Result<()> {
         let dual_mode = self.ports.len() > 1;
         let brightness = self.brightness.clone();
-        let new_self = Self::new_with_brightness(brightness, dual_mode, self.height)?;
-
-        *self = new_self;
-
-        println!("Successfully reconnected to LED Matrix");
+        let resume_flag = self.resume_flag.clone();
+        let new_matrix = Self::new_with_brightness(brightness, dual_mode, self.height)?;
+        *self = new_matrix;
+        self.resume_flag = resume_flag;
         Ok(())
     }
 
@@ -186,36 +182,60 @@ impl LedMatrix {
 
     #[inline]
     pub fn render(&mut self, game_state: &GameState) -> Result<()> {
-        // Attempt render with error recovery
-        match self.render_internal(game_state) {
-            Ok(()) => {
-                self.consecutive_errors = 0;
-                Ok(())
-            }
-            Err(e) => {
-                self.consecutive_errors += 1;
-                eprintln!(
-                    "Render error (#{} consecutive): {}",
-                    self.consecutive_errors, e
-                );
+        if self.resume_flag.swap(false, Ordering::Acquire) {
+            eprintln!("Resume detected, triggering reconnect...");
+            self.state = MatrixState::Suspended;
+        }
 
-                // If too many consecutive errors, attempt reconnection
-                if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                    eprintln!("Too many consecutive errors, attempting device reset...");
-                    match self.reconnect() {
-                        Ok(()) => {
-                            // Try rendering again after successful reconnection
-                            self.render_internal(game_state)
-                        }
-                        Err(reconnect_err) => {
-                            eprintln!("Failed to reconnect: {}", reconnect_err);
-                            Err(reconnect_err)
-                        }
+        match self.state {
+            MatrixState::Active => {
+                self.frame_count += 1;
+
+                if self.frame_count % HEARTBEAT_INTERVAL == 0 {
+                    let healthy = self.ports.first()
+                        .map_or(false, |p| p.port.bytes_to_read().is_ok());
+                    if !healthy {
+                        eprintln!("Health check failed, suspending...");
+                        self.state = MatrixState::Suspended;
+                        return Err(anyhow!("Port health check failed"));
                     }
-                } else {
-                    // For occasional errors, just wait a bit and continue
-                    thread::sleep(Duration::from_millis(50));
-                    Err(e)
+                }
+
+                match self.render_internal(game_state) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        eprintln!("Render error: {}", e);
+                        self.state = MatrixState::Suspended;
+                        Err(e)
+                    }
+                }
+            }
+            MatrixState::Suspended | MatrixState::Recovering => {
+                let now = Instant::now();
+                if now.duration_since(self.last_recovery_attempt)
+                    < Duration::from_millis(RECOVERY_INTERVAL_MS)
+                {
+                    thread::sleep(Duration::from_millis(100));
+                    return Ok(());
+                }
+                self.last_recovery_attempt = now;
+                self.state = MatrixState::Recovering;
+
+                eprintln!("Attempting to reconnect to LED Matrix...");
+                match self.try_reconnect() {
+                    Ok(()) => {
+                        self.state = MatrixState::Active;
+                        self.frame_count = 0;
+                        println!("Successfully reconnected to LED Matrix");
+                        let brightness = self.brightness.load(Ordering::Relaxed);
+                        let _ = self.set_brightness(brightness);
+                        self.render_internal(game_state)
+                    }
+                    Err(e) => {
+                        self.state = MatrixState::Suspended;
+                        eprintln!("Failed to reconnect: {}", e);
+                        Err(e)
+                    }
                 }
             }
         }
@@ -223,25 +243,35 @@ impl LedMatrix {
 
     #[inline]
     fn render_internal(&mut self, game_state: &GameState) -> Result<()> {
+        let gw = game_state.width();
+        let gh = game_state.height();
+
+        let mut ball_mask = [false; 18 * 34];
+        for ball in &game_state.balls {
+            let bx = ball.x as usize;
+            let by = ball.y as usize;
+            if bx < gw && by < gh {
+                ball_mask[bx * gh + by] = true;
+            }
+        }
+
         for port_index in 0..self.ports.len() {
             let port = &mut self.ports[port_index];
 
-            let mut vals = [0u8; 39];
+            port.bw_buffer[3..42].fill(0);
             for y in 0..self.height {
-                if y >= game_state.height() {
+                if y >= gh {
                     break;
                 }
                 for local_x in 0..port.width {
                     let global_x = port_index * port.width + local_x;
-                    if global_x >= game_state.width() {
+                    if global_x >= gw {
                         break;
                     }
 
-                    let square_color = game_state.squares[global_x][y];
-                    let has_ball = game_state
-                        .balls
-                        .iter()
-                        .any(|ball| (ball.x as usize == global_x) && (ball.y as usize == y));
+                    let idx = global_x * gh + y;
+                    let square_color = game_state.squares[idx];
+                    let has_ball = ball_mask[idx];
 
                     let on = match square_color {
                         SquareColor::Day => !has_ball,
@@ -250,21 +280,16 @@ impl LedMatrix {
 
                     if on {
                         let i = local_x + MODULE_WIDTH * y;
-                        let byte = i / 8;
+                        let byte = 3 + i / 8;
                         let bit = i % 8;
-                        vals[byte] |= 1u8 << bit;
+                        port.bw_buffer[byte] |= 1u8 << bit;
                     }
                 }
             }
 
-            let mut buf = Vec::with_capacity(3 + vals.len());
-            buf.push(MAGIC_WORD[0]);
-            buf.push(MAGIC_WORD[1]);
-            buf.push(CMD_DRAW_BW);
-            buf.extend_from_slice(&vals);
             port
                 .port
-                .write_all(&buf)
+                .write_all(&port.bw_buffer)
                 .map_err(|e| anyhow!("Failed to write BW frame on port {}: {}", port_index, e))?;
         }
 

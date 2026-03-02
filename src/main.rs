@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 mod game;
 mod led_matrix;
+mod power;
 
 use game::{GameState, DEFAULT_GRID_HEIGHT};
 use led_matrix::LedMatrix;
@@ -27,6 +28,15 @@ struct Args {
 
     #[arg(long = "debug")]
     debug: bool,
+
+    #[arg(long, help = "Install as Windows startup application")]
+    install: bool,
+
+    #[arg(long, help = "Remove Windows startup entry")]
+    uninstall: bool,
+
+    #[arg(long = "hide-console", help = "Hide the console window (Windows only)")]
+    hide_console: bool,
 }
 
 fn percent_to_led_value(percent: u8) -> u8 {
@@ -35,6 +45,30 @@ fn percent_to_led_value(percent: u8) -> u8 {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.install || args.uninstall {
+        #[cfg(windows)]
+        {
+            if args.install {
+                install_startup(&args)?;
+            } else {
+                uninstall_startup()?;
+            }
+            return Ok(());
+        }
+        #[cfg(not(windows))]
+        {
+            eprintln!("--install/--uninstall is only supported on Windows.");
+            std::process::exit(1);
+        }
+    }
+
+    #[cfg(windows)]
+    if args.hide_console {
+        unsafe {
+            let _ = windows::Win32::System::Console::FreeConsole();
+        }
+    }
 
     let brightness_value = percent_to_led_value(args.brightness);
     let brightness_atomic = Arc::new(AtomicU8::new(brightness_value));
@@ -46,6 +80,21 @@ fn main() -> Result<()> {
     )?;
     matrix.set_brightness(brightness_value)?;
 
+    let resume_flag = matrix.resume_flag();
+    #[cfg(windows)]
+    let _power_guard = match power::register_resume_notification(resume_flag) {
+        Ok(guard) => {
+            println!("Registered Windows power resume notification.");
+            Some(guard)
+        }
+        Err(e) => {
+            eprintln!("Warning: could not register power notification: {}", e);
+            None
+        }
+    };
+    #[cfg(not(windows))]
+    let _ = resume_flag;
+
     let width = matrix.width();
     let max_fps = matrix.estimated_max_fps() as u8;
     let effective_fps = args.speed.min(max_fps).max(1);
@@ -56,7 +105,7 @@ fn main() -> Result<()> {
 
     ctrlc::set_handler(|| {
         println!("Received interrupt, shutting down...");
-        SHUTDOWN.store(true, Ordering::SeqCst);
+        SHUTDOWN.store(true, Ordering::Release);
     })?;
 
     let balls_per_team: u8 = args.balls.unwrap_or(1);
@@ -67,6 +116,57 @@ fn main() -> Result<()> {
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+#[cfg(windows)]
+fn install_startup(args: &Args) -> Result<()> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let exe = std::env::current_exe()?;
+    let mut cmd = format!("\"{}\"", exe.display());
+
+    if args.dual_mode {
+        cmd.push_str(" --dualmode");
+    }
+    if let Some(balls) = args.balls {
+        cmd.push_str(&format!(" --balls {}", balls));
+    }
+    if args.speed != 64 {
+        cmd.push_str(&format!(" --speed {}", args.speed));
+    }
+    if args.brightness != 50 {
+        cmd.push_str(&format!(" --brightness {}", args.brightness));
+    }
+    if args.debug {
+        cmd.push_str(" --debug");
+    }
+    if args.hide_console {
+        cmd.push_str(" --hide-console");
+    }
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let (key, _) = hkcu.create_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run")?;
+    key.set_value("FW16PongWars", &cmd)?;
+
+    println!("Installed startup entry: {}", cmd);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn uninstall_startup() -> Result<()> {
+    use winreg::enums::*;
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let key = hkcu.open_subkey_with_flags(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        KEY_WRITE,
+    )?;
+    key.delete_value("FW16PongWars")?;
+
+    println!("Removed startup entry.");
+    Ok(())
+}
 
 fn run_game_loop(
     matrix: &mut LedMatrix,
@@ -83,8 +183,8 @@ fn run_game_loop(
     let mut last_frame_start = next_frame_time;
     let mut frame_index: u64 = 0;
 
-    let mut last_sent_brightness = brightness.load(Ordering::SeqCst);
-    while !SHUTDOWN.load(Ordering::SeqCst) {
+    let mut last_sent_brightness = brightness.load(Ordering::Relaxed);
+    while !SHUTDOWN.load(Ordering::Relaxed) {
         let now = Instant::now();
 
         if now >= next_frame_time {
@@ -115,7 +215,7 @@ fn run_game_loop(
         } else {
             let sleep_duration = next_frame_time.saturating_duration_since(now);
 
-            if let Some(coarse_sleep) = sleep_duration.checked_sub(Duration::from_millis(1)) {
+            if let Some(coarse_sleep) = sleep_duration.checked_sub(Duration::from_micros(500)) {
                 if debug {
                     println!(
                         "[debug] sleeping {:?} before spin (coarse={:?})",
@@ -137,7 +237,7 @@ fn run_game_loop(
             }
         }
 
-        let desired_brightness = brightness.load(Ordering::SeqCst);
+        let desired_brightness = brightness.load(Ordering::Relaxed);
         if desired_brightness != last_sent_brightness {
             matrix.set_brightness(desired_brightness)?;
             last_sent_brightness = desired_brightness;
