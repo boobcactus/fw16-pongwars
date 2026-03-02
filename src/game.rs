@@ -7,6 +7,9 @@ const MIN_SPEED: f32 = 0.2;
 const MAX_SPEED: f32 = 0.5;
 const SPEED_RANDOMNESS: f32 = 0.001;
 
+const KICKOFF_HOLD_FRAMES: u16 = 24;
+const KICKOFF_RAMP_FRAMES: u16 = 16;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SquareColor {
     Day,
@@ -44,6 +47,8 @@ pub struct GameState {
     back_buffer: Vec<SquareColor>,
     pub balls: Vec<Ball>,
     rng: SmallRng,
+    kickoff_countdown: u16,
+    ramp_remaining: u16,
 }
 
 impl GameState {
@@ -108,6 +113,8 @@ impl GameState {
             back_buffer,
             balls,
             rng,
+            kickoff_countdown: KICKOFF_HOLD_FRAMES,
+            ramp_remaining: KICKOFF_RAMP_FRAMES,
         }
     }
 
@@ -121,8 +128,25 @@ impl GameState {
         self.height
     }
 
+    pub fn reset_kickoff(&mut self) {
+        self.kickoff_countdown = KICKOFF_HOLD_FRAMES;
+        self.ramp_remaining = KICKOFF_RAMP_FRAMES;
+    }
+
     #[inline]
     pub fn update(&mut self) {
+        if self.kickoff_countdown > 0 {
+            self.kickoff_countdown -= 1;
+            return;
+        }
+
+        let speed_scale = if self.ramp_remaining > 0 {
+            self.ramp_remaining -= 1;
+            (KICKOFF_RAMP_FRAMES - self.ramp_remaining) as f32 / KICKOFF_RAMP_FRAMES as f32
+        } else {
+            1.0
+        };
+
         self.back_buffer.copy_from_slice(&self.squares);
 
         for i in 0..self.balls.len() {
@@ -184,8 +208,8 @@ impl GameState {
                 }
             }
 
-            ball_state.x += ball_state.dx;
-            ball_state.y += ball_state.dy;
+            ball_state.x += ball_state.dx * speed_scale;
+            ball_state.y += ball_state.dy * speed_scale;
 
             ball_state.dx += self.rng.gen_range(-SPEED_RANDOMNESS..SPEED_RANDOMNESS);
             ball_state.dy += self.rng.gen_range(-SPEED_RANDOMNESS..SPEED_RANDOMNESS);

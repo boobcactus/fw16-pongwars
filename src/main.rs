@@ -78,13 +78,13 @@ fn main() -> Result<()> {
         args.dual_mode,
         DEFAULT_GRID_HEIGHT,
     )?;
-    matrix.set_brightness(brightness_value)?;
 
     let resume_flag = matrix.resume_flag();
+    let suspend_sync = matrix.suspend_sync();
     #[cfg(windows)]
-    let _power_guard = match power::register_resume_notification(resume_flag) {
+    let _power_guard = match power::register_power_notification(resume_flag, suspend_sync) {
         Ok(guard) => {
-            println!("Registered Windows power resume notification.");
+            println!("Registered Windows power notification (suspend + resume).");
             Some(guard)
         }
         Err(e) => {
@@ -93,7 +93,7 @@ fn main() -> Result<()> {
         }
     };
     #[cfg(not(windows))]
-    let _ = resume_flag;
+    let _ = (resume_flag, suspend_sync);
 
     let width = matrix.width();
     let max_fps = matrix.estimated_max_fps() as u8;
@@ -204,6 +204,11 @@ fn run_game_loop(
                 std::thread::sleep(Duration::from_millis(10));
             }
 
+            if matrix.just_reconnected() {
+                game_state.reset_kickoff();
+            }
+
+            let now = Instant::now();
             let scheduled_next = next_frame_time + frame_duration;
             if now.saturating_duration_since(next_frame_time) > frame_duration {
                 next_frame_time = now + frame_duration;

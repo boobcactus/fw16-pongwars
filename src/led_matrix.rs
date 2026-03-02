@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::game::{GameState, SquareColor};
+use crate::power::SuspendSync;
 
 const BAUD_RATE: u32 = 115200;
 const TIMEOUT_MS: u64 = 1000;
@@ -21,6 +22,7 @@ const MODULE_WIDTH: usize = 9;
 // Flow control constants
 const HEARTBEAT_INTERVAL: u64 = 64; // Frames between health checks (~1s at 64fps)
 const RECOVERY_INTERVAL_MS: u64 = 2000; // Minimum ms between reconnect attempts
+const FADE_FRAMES: u16 = 24; // Frames to fade brightness in (~0.5s at 48fps)
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MatrixState {
@@ -36,10 +38,21 @@ struct MatrixPort {
 }
 
 impl MatrixPort {
-    fn new(port: Box<dyn SerialPort>, _height: usize) -> Result<Self> {
+    fn new(mut port: Box<dyn SerialPort>, _height: usize) -> Result<Self> {
         if let Err(e) = port.clear(serialport::ClearBuffer::All) {
             return Err(anyhow!("Failed clearing port: {}", e));
         }
+
+        // Immediately hide any stale display content from a previous session
+        let brightness_off = [MAGIC_WORD[0], MAGIC_WORD[1], CMD_BRIGHTNESS, 0];
+        let _ = port.write_all(&brightness_off);
+        let mut blank_frame = [0u8; 42];
+        blank_frame[0] = MAGIC_WORD[0];
+        blank_frame[1] = MAGIC_WORD[1];
+        blank_frame[2] = CMD_DRAW_BW;
+        let _ = port.write_all(&blank_frame);
+        let _ = port.flush();
+
         thread::sleep(Duration::from_millis(100));
 
         let mut bw_buffer = [0u8; 42];
@@ -62,8 +75,11 @@ pub struct LedMatrix {
     frame_count: u64,
     last_recovery_attempt: Instant,
     resume_flag: Arc<AtomicBool>,
+    suspend_sync: Arc<SuspendSync>,
     width: usize,
     height: usize,
+    fade_remaining: u16,
+    reconnected_flag: bool,
 }
 
 impl LedMatrix {
@@ -113,8 +129,11 @@ impl LedMatrix {
             );
         }
 
-        let mut matrix_ports: Vec<MatrixPort> = Vec::new();
-        for info in desired_ports {
+        // Phase 1: Open every port and immediately quench brightness so stale
+        //          framebuffer content is hidden before any slow per-port init.
+        let brightness_off = [MAGIC_WORD[0], MAGIC_WORD[1], CMD_BRIGHTNESS, 0];
+        let mut raw_ports: Vec<(String, Box<dyn SerialPort>)> = Vec::new();
+        for info in &desired_ports {
             match serialport::new(&info.port_name, BAUD_RATE)
                 .timeout(Duration::from_millis(TIMEOUT_MS))
                 .data_bits(DataBits::Eight)
@@ -122,19 +141,55 @@ impl LedMatrix {
                 .stop_bits(StopBits::One)
                 .open()
             {
-                Ok(port) => match MatrixPort::new(Box::from(port), height) {
-                    Ok(matrix_port) => {
-                        println!("Connected LED Matrix on {}", info.port_name);
-                        matrix_ports.push(matrix_port);
-                    }
-                    Err(e) => eprintln!("Failed initializing port {}: {}", info.port_name, e),
-                },
+                Ok(port) => raw_ports.push((info.port_name.clone(), Box::from(port))),
                 Err(e) => eprintln!("Failed opening port {}: {}", info.port_name, e),
+            }
+        }
+        for (_, port) in &mut raw_ports {
+            let _ = port.write_all(&brightness_off);
+            let _ = port.flush();
+        }
+
+        // Phase 2: Full per-port initialisation (clear, blank frame, settle).
+        let mut matrix_ports: Vec<MatrixPort> = Vec::new();
+        for (name, port) in raw_ports {
+            match MatrixPort::new(port, height) {
+                Ok(matrix_port) => {
+                    println!("Connected LED Matrix on {}", name);
+                    matrix_ports.push(matrix_port);
+                }
+                Err(e) => eprintln!("Failed initializing port {}: {}", name, e),
             }
         }
 
         if matrix_ports.is_empty() {
             return Err(anyhow!("Unable to open any Framework LED Matrix modules."));
+        }
+
+        // Stabilize ports: retry blank frame writes until the hardware is responsive
+        let blank_frame = {
+            let mut buf = [0u8; 42];
+            buf[0] = MAGIC_WORD[0];
+            buf[1] = MAGIC_WORD[1];
+            buf[2] = CMD_DRAW_BW;
+            buf
+        };
+        for port in &mut matrix_ports {
+            for attempt in 0..10 {
+                match port.port.write_all(&blank_frame) {
+                    Ok(()) => {
+                        let _ = port.port.flush();
+                        break;
+                    }
+                    Err(_) if attempt < 9 => {
+                        let _ = port.port.clear(serialport::ClearBuffer::All);
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: port stabilization failed: {}", e);
+                    }
+                }
+            }
         }
 
         Ok(LedMatrix {
@@ -146,6 +201,9 @@ impl LedMatrix {
             frame_count: 0,
             last_recovery_attempt: Instant::now(),
             resume_flag: Arc::new(AtomicBool::new(false)),
+            suspend_sync: SuspendSync::new(),
+            fade_remaining: FADE_FRAMES,
+            reconnected_flag: false,
         })
     }
 
@@ -157,19 +215,54 @@ impl LedMatrix {
         self.resume_flag.clone()
     }
 
+    pub fn suspend_sync(&self) -> Arc<SuspendSync> {
+        self.suspend_sync.clone()
+    }
+
+    pub fn just_reconnected(&mut self) -> bool {
+        let flag = self.reconnected_flag;
+        self.reconnected_flag = false;
+        flag
+    }
+
+    fn blank_all(&mut self) {
+        let brightness_off = [MAGIC_WORD[0], MAGIC_WORD[1], CMD_BRIGHTNESS, 0];
+        let mut blank_frame = [0u8; 42];
+        blank_frame[0] = MAGIC_WORD[0];
+        blank_frame[1] = MAGIC_WORD[1];
+        blank_frame[2] = CMD_DRAW_BW;
+
+        for port in &mut self.ports {
+            let _ = port.port.write_all(&brightness_off);
+            let _ = port.port.write_all(&blank_frame);
+            let _ = port.port.flush();
+        }
+    }
+
     fn try_reconnect(&mut self) -> Result<()> {
-        let dual_mode = self.ports.len() > 1;
+        let dual_mode = self.width > MODULE_WIDTH;
+        // Drop old port handles so the OS can release them
+        self.ports.clear();
+        thread::sleep(Duration::from_millis(500));
+
         let brightness = self.brightness.clone();
         let resume_flag = self.resume_flag.clone();
+        let suspend_sync = self.suspend_sync.clone();
         let new_matrix = Self::new_with_brightness(brightness, dual_mode, self.height)?;
         *self = new_matrix;
         self.resume_flag = resume_flag;
+        self.suspend_sync = suspend_sync;
         Ok(())
     }
 
     #[inline]
     pub fn set_brightness(&mut self, brightness: u8) -> Result<()> {
         self.brightness.store(brightness, Ordering::SeqCst);
+        self.send_brightness_hw(brightness)
+    }
+
+    #[inline]
+    fn send_brightness_hw(&mut self, brightness: u8) -> Result<()> {
         for (idx, port) in self.ports.iter_mut().enumerate() {
             let buf = [MAGIC_WORD[0], MAGIC_WORD[1], CMD_BRIGHTNESS, brightness];
             port
@@ -182,14 +275,32 @@ impl LedMatrix {
 
     #[inline]
     pub fn render(&mut self, game_state: &GameState) -> Result<()> {
+        if self.suspend_sync.requested.load(Ordering::Acquire) {
+            eprintln!("Suspend detected, blanking display...");
+            self.blank_all();
+            self.suspend_sync.acked.store(true, Ordering::Release);
+            self.state = MatrixState::Suspended;
+            self.ports.clear();
+            return Ok(());
+        }
+
         if self.resume_flag.swap(false, Ordering::Acquire) {
             eprintln!("Resume detected, triggering reconnect...");
             self.state = MatrixState::Suspended;
+            self.ports.clear();
         }
 
         match self.state {
             MatrixState::Active => {
                 self.frame_count += 1;
+
+                if self.fade_remaining > 0 {
+                    self.fade_remaining -= 1;
+                    let target = self.brightness.load(Ordering::Relaxed) as u16;
+                    let progress = FADE_FRAMES - self.fade_remaining;
+                    let interp = ((target * progress) / FADE_FRAMES) as u8;
+                    let _ = self.send_brightness_hw(interp);
+                }
 
                 if self.frame_count % HEARTBEAT_INTERVAL == 0 {
                     let healthy = self.ports.first()
@@ -197,6 +308,7 @@ impl LedMatrix {
                     if !healthy {
                         eprintln!("Health check failed, suspending...");
                         self.state = MatrixState::Suspended;
+                        self.ports.clear();
                         return Err(anyhow!("Port health check failed"));
                     }
                 }
@@ -206,6 +318,7 @@ impl LedMatrix {
                     Err(e) => {
                         eprintln!("Render error: {}", e);
                         self.state = MatrixState::Suspended;
+                        self.ports.clear();
                         Err(e)
                     }
                 }
@@ -226,9 +339,9 @@ impl LedMatrix {
                     Ok(()) => {
                         self.state = MatrixState::Active;
                         self.frame_count = 0;
+                        self.fade_remaining = FADE_FRAMES;
+                        self.reconnected_flag = true;
                         println!("Successfully reconnected to LED Matrix");
-                        let brightness = self.brightness.load(Ordering::Relaxed);
-                        let _ = self.set_brightness(brightness);
                         self.render_internal(game_state)
                     }
                     Err(e) => {
@@ -303,5 +416,14 @@ impl LedMatrix {
         let bytes_per_sec = (BAUD_RATE as f64) / 10.0;
         let fps = (bytes_per_sec / ((total as f64) * 1.1)).floor() as u32;
         if fps < 1 { 1 } else { fps }
+    }
+}
+
+impl Drop for LedMatrix {
+    fn drop(&mut self) {
+        self.blank_all();
+        // Give the serial driver time to drain the blank commands to the
+        // firmware before the port handles are closed.
+        thread::sleep(Duration::from_millis(50));
     }
 }
