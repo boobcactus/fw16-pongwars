@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 mod game;
 mod led_matrix;
 mod power;
+mod tray;
 
 use game::{GameState, DEFAULT_GRID_HEIGHT};
 use led_matrix::LedMatrix;
@@ -108,14 +109,24 @@ fn main() -> Result<()> {
         SHUTDOWN.store(true, Ordering::Release);
     })?;
 
+    #[cfg(windows)]
+    let tray_handle = std::thread::spawn(|| {
+        tray::run_tray(&SHUTDOWN, &PAUSED, &RESET_REQUESTED);
+    });
+
     let balls_per_team: u8 = args.balls.unwrap_or(1);
     run_game_loop(&mut matrix, effective_fps, brightness_atomic, args.debug, balls_per_team)?;
+
+    #[cfg(windows)]
+    let _ = tray_handle.join();
 
     println!("Exited cleanly.");
     Ok(())
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static PAUSED: AtomicBool = AtomicBool::new(false);
+static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(windows)]
 fn install_startup(args: &Args) -> Result<()> {
@@ -197,7 +208,13 @@ fn run_game_loop(
                 );
             }
 
-            game_state.update();
+            if RESET_REQUESTED.swap(false, Ordering::Relaxed) {
+                game_state = GameState::new(width, DEFAULT_GRID_HEIGHT, balls_per_team);
+            }
+
+            if !PAUSED.load(Ordering::Relaxed) {
+                game_state.update();
+            }
 
             if let Err(e) = matrix.render(&game_state) {
                 eprintln!("Render error: {}", e);

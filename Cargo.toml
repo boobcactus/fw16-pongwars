@@ -24,6 +24,8 @@ codegen-units = 1
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = ["Win32_System_Power", "Win32_System_Console", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 winreg = "0.52"
+tray-icon = "0.21"
+image = { version = "0.25", default-features = false, features = ["ico"] }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
