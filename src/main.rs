@@ -75,8 +75,17 @@ fn main() -> Result<()> {
         };
         (s, None)
     } else {
-        // Mode 3: bare run, hardcoded defaults
-        (settings::Settings::default(), None)
+        // Mode 3: bare run — use settings.toml next to the executable
+        let default_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.join("settings.toml")));
+        match default_path {
+            Some(ref path) => {
+                let s = settings::Settings::load_or_create(path)?;
+                (s, Some(path.clone()))
+            }
+            None => (settings::Settings::default(), None),
+        }
     };
 
     // Apply startup registry when using a settings file

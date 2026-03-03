@@ -2,6 +2,7 @@
 mod windows_dialog {
     use crate::settings::Settings;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use windows::core::*;
     use windows::Win32::Foundation::*;
@@ -37,6 +38,7 @@ mod windows_dialog {
     struct DialogState {
         settings: Settings,
         settings_path: std::path::PathBuf,
+        shutdown: &'static AtomicBool,
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -47,10 +49,11 @@ mod windows_dialog {
         HMENU(id as *mut _)
     }
 
-    pub fn show_settings_dialog(current: &Settings, settings_path: &Path) {
+    pub fn show_settings_dialog(current: &Settings, settings_path: &Path, shutdown: &'static AtomicBool) {
         let state = Box::new(DialogState {
             settings: current.clone(),
             settings_path: settings_path.to_path_buf(),
+            shutdown,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -310,10 +313,15 @@ mod windows_dialog {
                                     MessageBoxW(hwnd, PCWSTR(msg_text.as_ptr()), w!("Error"),
                                         MB_OK | MB_ICONERROR);
                                 } else {
-                                    MessageBoxW(hwnd,
-                                        w!("Settings saved. Restart the application for changes to take effect."),
-                                        w!("Settings Saved"),
-                                        MB_OK | MB_ICONINFORMATION);
+                                    // Spawn a new instance with the same settings file
+                                    if let Ok(exe) = std::env::current_exe() {
+                                        let _ = std::process::Command::new(exe)
+                                            .arg("--settings")
+                                            .arg(&state.settings_path)
+                                            .spawn();
+                                    }
+                                    // Signal the current process to shut down
+                                    state.shutdown.store(true, Ordering::Release);
                                     let _ = DestroyWindow(hwnd);
                                 }
                             }

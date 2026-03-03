@@ -87,7 +87,7 @@ mod windows_tray {
                 } else if let Some(ref si) = settings_item {
                     if event.id() == si.id() {
                         if let Some(ref sp) = settings_path {
-                            crate::settings_dialog::show_settings_dialog(&settings, sp);
+                            crate::settings_dialog::show_settings_dialog(&settings, sp, shutdown);
                         }
                     }
                 }
