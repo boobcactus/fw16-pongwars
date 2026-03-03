@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (e.g., v1.2.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & Release
+    # Pinned to windows-2022 because NSIS is pre-installed.
+    # windows-latest will migrate to Server 2025 (no NSIS) in late 2025.
+    runs-on: windows-2022
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine version
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $ver = "${{ github.event.inputs.version }}"
+          } else {
+            $ver = "${{ github.ref_name }}"
+          }
+          echo "tag=$ver" >> $env:GITHUB_OUTPUT
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build portable exe
+        run: cargo build --release
+
+      - name: Build NSIS installer
+        run: |
+          cargo install cargo-packager --locked
+          cargo packager --release --formats nsis
+
+      - name: Collect artifacts
+        id: artifacts
+        shell: pwsh
+        run: |
+          $exe = "target/release/fw16-pongwars.exe"
+          if (-not (Test-Path $exe)) { throw "Portable exe not found at $exe" }
+          $installer = Get-ChildItem -Path "target/release" -Filter "*setup*" -Recurse | Select-Object -First 1
+          if (-not $installer) { throw "NSIS installer not found under target/release" }
+          echo "exe=$exe" >> $env:GITHUB_OUTPUT
+          echo "installer=$($installer.FullName -replace '\\','/')" >> $env:GITHUB_OUTPUT
+
+      - name: Create tag (manual dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          git tag -f ${{ steps.version.outputs.tag }}
+          git push origin -f ${{ steps.version.outputs.tag }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.artifacts.outputs.exe }}
+            ${{ steps.artifacts.outputs.installer }}
+            settings.example.toml

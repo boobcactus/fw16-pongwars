@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build & Validate
+    # Pinned to windows-2022 because NSIS is pre-installed.
+    # windows-latest will migrate to Server 2025 (no NSIS) in late 2025.
+    runs-on: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build portable exe
+        run: cargo build --release
+
+      - name: Build NSIS installer
+        run: |
+          cargo install cargo-packager --locked
+          cargo packager --release --formats nsis
