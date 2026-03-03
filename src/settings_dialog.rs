@@ -20,12 +20,16 @@ mod windows_dialog {
     const ID_BRIGHTNESS_UPDOWN: i32 = 107;
     const ID_DEBUG_CHECK: i32 = 108;
     const ID_STARTUP_CHECK: i32 = 109;
+    const ID_MODULE_LABEL: i32 = 110;
+    const ID_MODULE_LEFT_RADIO: i32 = 111;
+    const ID_MODULE_RIGHT_RADIO: i32 = 112;
     const ID_SAVE_BTN: i32 = 201;
     const ID_CANCEL_BTN: i32 = 202;
 
     // Win32 style constants not exposed by windows crate
     const BS_AUTOCHECKBOX: u32 = 0x0003;
     const BS_PUSHBUTTON: u32 = 0x0000;
+    const BS_AUTORADIOBUTTON: u32 = 0x0009;
     const ES_NUMBER: u32 = 0x2000;
     const BN_CLICKED: u32 = 0;
 
@@ -39,6 +43,8 @@ mod windows_dialog {
         settings: Settings,
         settings_path: std::path::PathBuf,
         shutdown: &'static AtomicBool,
+        restart_pending: &'static AtomicBool,
+        detected_modules: Vec<(String, String)>,
     }
 
     fn wide(s: &str) -> Vec<u16> {
@@ -49,11 +55,14 @@ mod windows_dialog {
         HMENU(id as *mut _)
     }
 
-    pub fn show_settings_dialog(current: &Settings, settings_path: &Path, shutdown: &'static AtomicBool) {
+    pub fn show_settings_dialog(current: &Settings, settings_path: &Path, shutdown: &'static AtomicBool, restart_pending: &'static AtomicBool) {
+        let detected_modules = crate::led_matrix::detect_modules();
         let state = Box::new(DialogState {
             settings: current.clone(),
             settings_path: settings_path.to_path_buf(),
             shutdown,
+            restart_pending,
+            detected_modules,
         });
         let state_ptr = Box::into_raw(state);
 
@@ -73,7 +82,7 @@ mod windows_dialog {
             RegisterClassW(&wc);
 
             let width = 360;
-            let height = 360;
+            let height = 400;
             let screen_w = GetSystemMetrics(SM_CXSCREEN);
             let screen_h = GetSystemMetrics(SM_CYSCREEN);
             let x = (screen_w - width) / 2;
@@ -242,6 +251,79 @@ mod windows_dialog {
                         ID_DUALMODE_CHECK, state.settings.dual_mode);
                     y += row_h + 10;
 
+                    // Module picker row (visible only when dual mode is off and 2+ modules)
+                    let show_picker = !state.settings.dual_mode && state.detected_modules.len() >= 2;
+                    let picker_style = if show_picker {
+                        WS_CHILD | WS_VISIBLE
+                    } else {
+                        WS_CHILD
+                    };
+                    let picker_tab_style = if show_picker {
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP
+                    } else {
+                        WS_CHILD | WS_TABSTOP
+                    };
+
+                    {
+                        let label_text = wide("Module:");
+                        let _ = CreateWindowExW(
+                            WINDOW_EX_STYLE::default(),
+                            w!("STATIC"),
+                            PCWSTR(label_text.as_ptr()),
+                            picker_style,
+                            margin, y + 3, 60, row_h,
+                            hwnd,
+                            hmenu_from_id(ID_MODULE_LABEL),
+                            HINSTANCE::default(),
+                            None,
+                        );
+                    }
+
+                    let left_label = if let Some((com, _)) = state.detected_modules.iter().find(|(_, pos)| pos == "left") {
+                        format!("Left ({})", com)
+                    } else {
+                        "Left".to_string()
+                    };
+                    let right_label = if let Some((com, _)) = state.detected_modules.iter().find(|(_, pos)| pos == "right") {
+                        format!("Right ({})", com)
+                    } else {
+                        "Right".to_string()
+                    };
+
+                    let left_text = wide(&left_label);
+                    let left_radio = CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("BUTTON"),
+                        PCWSTR(left_text.as_ptr()),
+                        picker_tab_style | WINDOW_STYLE(BS_AUTORADIOBUTTON),
+                        margin + 65, y, 120, row_h,
+                        hwnd,
+                        hmenu_from_id(ID_MODULE_LEFT_RADIO),
+                        HINSTANCE::default(),
+                        None,
+                    ).unwrap_or_default();
+
+                    let right_text = wide(&right_label);
+                    let right_radio = CreateWindowExW(
+                        WINDOW_EX_STYLE::default(),
+                        w!("BUTTON"),
+                        PCWSTR(right_text.as_ptr()),
+                        picker_tab_style | WINDOW_STYLE(BS_AUTORADIOBUTTON),
+                        margin + 190, y, 120, row_h,
+                        hwnd,
+                        hmenu_from_id(ID_MODULE_RIGHT_RADIO),
+                        HINSTANCE::default(),
+                        None,
+                    ).unwrap_or_default();
+
+                    if state.settings.module == "left" {
+                        SendMessageW(left_radio, BM_SETCHECK, WPARAM(1), LPARAM(0));
+                    } else {
+                        SendMessageW(right_radio, BM_SETCHECK, WPARAM(1), LPARAM(0));
+                    }
+
+                    y += row_h + 10;
+
                     create_label(hwnd, "Balls per team:", margin, y + 3, label_w, row_h);
                     create_edit_with_updown(hwnd, control_x, y, 60, row_h,
                         ID_BALLS_EDIT, ID_BALLS_UPDOWN, 1, 20, state.settings.balls as i32);
@@ -275,7 +357,14 @@ mod windows_dialog {
                     let notification = ((wparam.0 >> 16) & 0xFFFF) as u32;
 
                     if notification == BN_CLICKED {
-                        if id == ID_SAVE_BTN as u32 {
+                        if id == ID_DUALMODE_CHECK as u32 {
+                            let dual_hwnd = GetDlgItem(hwnd, ID_DUALMODE_CHECK).unwrap_or_default();
+                            let is_dual = SendMessageW(dual_hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1;
+                            let show_cmd = if is_dual { SW_HIDE } else { SW_SHOW };
+                            if let Ok(h) = GetDlgItem(hwnd, ID_MODULE_LABEL) { let _ = ShowWindow(h, show_cmd); }
+                            if let Ok(h) = GetDlgItem(hwnd, ID_MODULE_LEFT_RADIO) { let _ = ShowWindow(h, show_cmd); }
+                            if let Ok(h) = GetDlgItem(hwnd, ID_MODULE_RIGHT_RADIO) { let _ = ShowWindow(h, show_cmd); }
+                        } else if id == ID_SAVE_BTN as u32 {
                             let state_ptr =
                                 GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogState;
                             if !state_ptr.is_null() {
@@ -299,6 +388,13 @@ mod windows_dialog {
                                 let startup_hwnd = GetDlgItem(hwnd, ID_STARTUP_CHECK).unwrap_or_default();
                                 let start_with_windows = SendMessageW(startup_hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1;
 
+                                let module_left_hwnd = GetDlgItem(hwnd, ID_MODULE_LEFT_RADIO).unwrap_or_default();
+                                let module = if SendMessageW(module_left_hwnd, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == 1 {
+                                    "left".to_string()
+                                } else {
+                                    "right".to_string()
+                                };
+
                                 let new_settings = Settings {
                                     dual_mode,
                                     balls: balls.clamp(1, 20),
@@ -306,6 +402,7 @@ mod windows_dialog {
                                     brightness: brightness.clamp(0, 100),
                                     debug,
                                     start_with_windows,
+                                    module,
                                 };
 
                                 if let Err(e) = new_settings.save(&state.settings_path) {
@@ -313,14 +410,8 @@ mod windows_dialog {
                                     MessageBoxW(hwnd, PCWSTR(msg_text.as_ptr()), w!("Error"),
                                         MB_OK | MB_ICONERROR);
                                 } else {
-                                    // Spawn a new instance with the same settings file
-                                    if let Ok(exe) = std::env::current_exe() {
-                                        let _ = std::process::Command::new(exe)
-                                            .arg("--settings")
-                                            .arg(&state.settings_path)
-                                            .spawn();
-                                    }
-                                    // Signal the current process to shut down
+                                    // Signal main() to restart after cleanup
+                                    state.restart_pending.store(true, Ordering::Release);
                                     state.shutdown.store(true, Ordering::Release);
                                     let _ = DestroyWindow(hwnd);
                                 }

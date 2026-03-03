@@ -10,6 +10,7 @@ pub struct Settings {
     pub brightness: u8,
     pub debug: bool,
     pub start_with_windows: bool,
+    pub module: String,
 }
 
 impl Default for Settings {
@@ -21,6 +22,7 @@ impl Default for Settings {
             brightness: 40,
             debug: false,
             start_with_windows: true,
+            module: "right".to_string(),
         }
     }
 }

@@ -72,6 +72,7 @@ fn main() -> Result<()> {
             brightness: args.brightness.unwrap_or(40),
             debug: args.debug,
             start_with_windows: false,
+            module: "right".to_string(),
         };
         (s, None)
     } else {
@@ -102,6 +103,7 @@ fn main() -> Result<()> {
     let mut matrix = LedMatrix::new_with_brightness(
         brightness_atomic.clone(),
         settings.dual_mode,
+        &settings.module,
         DEFAULT_GRID_HEIGHT,
     )?;
 
@@ -139,7 +141,7 @@ fn main() -> Result<()> {
         let sp = settings_path.clone();
         let st = settings.clone();
         std::thread::spawn(move || {
-            tray::run_tray(&SHUTDOWN, &PAUSED, &RESET_REQUESTED, sp, st);
+            tray::run_tray(&SHUTDOWN, &PAUSED, &RESET_REQUESTED, &RESTART_PENDING, sp, st);
         })
     };
 
@@ -149,6 +151,19 @@ fn main() -> Result<()> {
     #[cfg(windows)]
     let _ = tray_handle.join();
 
+    // Drop matrix before restart so serial ports are released
+    drop(matrix);
+
+    if RESTART_PENDING.load(Ordering::Relaxed) {
+        if let (Ok(exe), Some(sp)) = (std::env::current_exe(), &settings_path) {
+            println!("Restarting...");
+            let _ = std::process::Command::new(exe)
+                .arg("--settings")
+                .arg(sp)
+                .spawn();
+        }
+    }
+
     println!("Exited cleanly.");
     Ok(())
 }
@@ -156,6 +171,7 @@ fn main() -> Result<()> {
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 static PAUSED: AtomicBool = AtomicBool::new(false);
 static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn run_game_loop(
     matrix: &mut LedMatrix,

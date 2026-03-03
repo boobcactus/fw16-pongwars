@@ -68,6 +68,45 @@ impl MatrixPort {
     }
 }
 
+/// Enumerate connected Framework LED Matrix modules without opening ports.
+/// Returns a vec of `(com_port_name, position)` where position is `"left"` or `"right"`.
+/// With a single module, it is labelled `"right"` (the more common slot).
+pub fn detect_modules() -> Vec<(String, String)> {
+    let mut candidates: Vec<serialport::SerialPortInfo> = serialport::available_ports()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(ref info) if info.vid == 0x32AC && (info.pid == 0x0020 || info.pid == 0x0021)))
+        .collect();
+
+    candidates.sort_by(|a, b| {
+        let sa = match &a.port_type {
+            serialport::SerialPortType::UsbPort(info) => info.serial_number.as_deref(),
+            _ => None,
+        };
+        let sb = match &b.port_type {
+            serialport::SerialPortType::UsbPort(info) => info.serial_number.as_deref(),
+            _ => None,
+        };
+        match (sa, sb) {
+            (Some(aa), Some(bb)) => aa.cmp(bb),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.port_name.cmp(&b.port_name),
+        }
+    });
+
+    candidates.truncate(2);
+
+    match candidates.len() {
+        0 => vec![],
+        1 => vec![(candidates[0].port_name.clone(), "right".to_string())],
+        _ => vec![
+            (candidates[0].port_name.clone(), "right".to_string()),
+            (candidates[1].port_name.clone(), "left".to_string()),
+        ],
+    }
+}
+
 pub struct LedMatrix {
     ports: Vec<MatrixPort>,
     brightness: Arc<AtomicU8>,
@@ -76,6 +115,7 @@ pub struct LedMatrix {
     last_recovery_attempt: Instant,
     resume_flag: Arc<AtomicBool>,
     suspend_sync: Arc<SuspendSync>,
+    preferred_module: String,
     width: usize,
     height: usize,
     fade_remaining: u16,
@@ -83,7 +123,7 @@ pub struct LedMatrix {
 }
 
 impl LedMatrix {
-    pub fn new_with_brightness(brightness: Arc<AtomicU8>, dual_mode: bool, height: usize) -> Result<Self> {
+    pub fn new_with_brightness(brightness: Arc<AtomicU8>, dual_mode: bool, preferred_module: &str, height: usize) -> Result<Self> {
         let mut candidates: Vec<serialport::SerialPortInfo> = serialport::available_ports()?
             .into_iter()
             .filter(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(ref info) if info.vid == 0x32AC && (info.pid == 0x0020 || info.pid == 0x0021)))
@@ -116,6 +156,15 @@ impl LedMatrix {
             }
             candidates.truncate(2);
             candidates
+        } else if candidates.len() >= 2 {
+            // Two modules detected in single mode — pick based on preference
+            candidates.truncate(2);
+            let idx = if preferred_module == "left" { 1 } else { 0 };
+            println!(
+                "Single mode: selected {} module on {}",
+                preferred_module, candidates[idx].port_name
+            );
+            vec![candidates.remove(idx)]
         } else {
             candidates.truncate(1);
             candidates
@@ -124,7 +173,7 @@ impl LedMatrix {
         if dual_mode && desired_ports.len() == 2 {
             desired_ports.reverse();
             println!(
-                "Auto-ordered modules: {} = right, {} = left",
+                "Auto-ordered modules: {} = left, {} = right",
                 desired_ports[0].port_name, desired_ports[1].port_name
             );
         }
@@ -202,6 +251,7 @@ impl LedMatrix {
             last_recovery_attempt: Instant::now(),
             resume_flag: Arc::new(AtomicBool::new(false)),
             suspend_sync: SuspendSync::new(),
+            preferred_module: preferred_module.to_string(),
             fade_remaining: FADE_FRAMES,
             reconnected_flag: false,
         })
@@ -241,6 +291,7 @@ impl LedMatrix {
 
     fn try_reconnect(&mut self) -> Result<()> {
         let dual_mode = self.width > MODULE_WIDTH;
+        let preferred = self.preferred_module.clone();
         // Drop old port handles so the OS can release them
         self.ports.clear();
         thread::sleep(Duration::from_millis(500));
@@ -248,7 +299,7 @@ impl LedMatrix {
         let brightness = self.brightness.clone();
         let resume_flag = self.resume_flag.clone();
         let suspend_sync = self.suspend_sync.clone();
-        let new_matrix = Self::new_with_brightness(brightness, dual_mode, self.height)?;
+        let new_matrix = Self::new_with_brightness(brightness, dual_mode, &preferred, self.height)?;
         *self = new_matrix;
         self.resume_flag = resume_flag;
         self.suspend_sync = suspend_sync;

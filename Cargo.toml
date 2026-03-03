@@ -37,7 +37,7 @@ product-name = "FW16 Pong Wars"
 identifier = "com.fw16.pongwars"
 description = "Pong Wars on the Framework Laptop 16 LED Matrix"
 icons = ["assets/icon.ico"]
-before-packaging-command = "cargo build --release"
+before-packaging-command = "cargo build --all-features --release"
 
 [package.metadata.packager.nsis]
 installer-icon = "assets/icon.ico"

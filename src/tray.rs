@@ -29,6 +29,7 @@ mod windows_tray {
         shutdown: &'static AtomicBool,
         paused: &'static AtomicBool,
         reset_requested: &'static AtomicBool,
+        restart_pending: &'static AtomicBool,
         settings_path: Option<PathBuf>,
         settings: Settings,
     ) {
@@ -87,7 +88,7 @@ mod windows_tray {
                 } else if let Some(ref si) = settings_item {
                     if event.id() == si.id() {
                         if let Some(ref sp) = settings_path {
-                            crate::settings_dialog::show_settings_dialog(&settings, sp, shutdown);
+                            crate::settings_dialog::show_settings_dialog(&settings, sp, shutdown, restart_pending);
                         }
                     }
                 }
