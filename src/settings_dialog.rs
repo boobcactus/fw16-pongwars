@@ -8,6 +8,7 @@ mod windows_dialog {
     use windows::Win32::Foundation::*;
     use windows::Win32::Graphics::Gdi::*;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Controls::{InitCommonControlsEx, INITCOMMONCONTROLSEX, ICC_STANDARD_CLASSES};
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     // Control IDs
@@ -67,6 +68,12 @@ mod windows_dialog {
         let state_ptr = Box::into_raw(state);
 
         unsafe {
+            let icc = INITCOMMONCONTROLSEX {
+                dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
+                dwICC: ICC_STANDARD_CLASSES,
+            };
+            let _ = InitCommonControlsEx(&icc);
+
             let hinstance = GetModuleHandleW(None).unwrap_or_default();
             let class_name = w!("FW16PongWarsSettings");
 
@@ -107,6 +114,14 @@ mod windows_dialog {
             if hwnd == HWND::default() {
                 let _ = Box::from_raw(state_ptr);
                 return;
+            }
+
+            // Set window icon from embedded resource (resource ID 1)
+            if let Ok(h) = LoadImageW(hinstance, PCWSTR(1 as *const u16), IMAGE_ICON, 16, 16, LR_SHARED) {
+                SendMessageW(hwnd, WM_SETICON, WPARAM(0), LPARAM(h.0 as isize)); // ICON_SMALL
+            }
+            if let Ok(h) = LoadImageW(hinstance, PCWSTR(1 as *const u16), IMAGE_ICON, 32, 32, LR_SHARED) {
+                SendMessageW(hwnd, WM_SETICON, WPARAM(1), LPARAM(h.0 as isize)); // ICON_BIG
             }
 
             let _ = ShowWindow(hwnd, SW_SHOW);
@@ -368,6 +383,18 @@ mod windows_dialog {
 
                     create_button(hwnd, "Save && Restart", margin, y, 140, 32, ID_SAVE_BTN);
                     create_button(hwnd, "Cancel", margin + 150, y, 100, 32, ID_CANCEL_BTN);
+
+                    // Set modern font (Segoe UI) on all child controls
+                    let font = GetStockObject(DEFAULT_GUI_FONT);
+                    unsafe extern "system" fn set_font_callback(
+                        child: HWND, lparam: LPARAM,
+                    ) -> BOOL {
+                        unsafe {
+                            SendMessageW(child, WM_SETFONT, WPARAM(lparam.0 as usize), LPARAM(1));
+                        }
+                        TRUE
+                    }
+                    let _ = EnumChildWindows(hwnd, Some(set_font_callback), LPARAM(font.0 as isize));
 
                     LRESULT(0)
                 }

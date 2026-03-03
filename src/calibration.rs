@@ -7,6 +7,8 @@ mod windows_calibration {
     use std::time::Duration;
 
     use windows::core::*;
+    use windows::Win32::Foundation::*;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::*;
 
     /// Run the interactive calibration flow.
@@ -72,12 +74,46 @@ mod windows_calibration {
             .collect();
 
         let result = unsafe {
-            MessageBoxW(
-                None,
+            // Create a hidden owner window so the MessageBox inherits our app icon
+            let hinstance = GetModuleHandleW(None).unwrap_or_default();
+            let owner_class = w!("FW16CalibOwner");
+            unsafe extern "system" fn wnd_proc_stub(
+                hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM,
+            ) -> LRESULT {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(wnd_proc_stub),
+                hInstance: hinstance.into(),
+                lpszClassName: owner_class,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            let owner = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                owner_class, w!(""),
+                WINDOW_STYLE::default(),
+                0, 0, 0, 0,
+                HWND::default(), HMENU::default(),
+                hinstance, None,
+            ).unwrap_or_default();
+            if let Ok(h) = LoadImageW(hinstance, PCWSTR(1 as *const u16), IMAGE_ICON, 16, 16, LR_SHARED) {
+                SendMessageW(owner, WM_SETICON, WPARAM(0), LPARAM(h.0 as isize));
+            }
+            if let Ok(h) = LoadImageW(hinstance, PCWSTR(1 as *const u16), IMAGE_ICON, 32, 32, LR_SHARED) {
+                SendMessageW(owner, WM_SETICON, WPARAM(1), LPARAM(h.0 as isize));
+            }
+
+            let r = MessageBoxW(
+                owner,
                 PCWSTR(msg_text.as_ptr()),
                 PCWSTR(title.as_ptr()),
                 MB_YESNO | MB_ICONQUESTION | MB_TOPMOST,
-            )
+            );
+
+            let _ = DestroyWindow(owner);
+            let _ = UnregisterClassW(owner_class, hinstance);
+            r
         };
 
         let a_is_left = result == MESSAGEBOX_RESULT(6); // IDYES = 6
