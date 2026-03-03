@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod calibration;
 mod game;
 mod led_matrix;
 mod power;
@@ -67,12 +69,14 @@ fn main() -> Result<()> {
         // Mode 2: explicit CLI flags
         let s = settings::Settings {
             dual_mode: args.dual_mode,
+            left_serial: String::new(),
+            right_serial: String::new(),
+            module: "right".to_string(),
             balls: args.balls.unwrap_or(2),
             speed: args.speed.unwrap_or(32),
             brightness: args.brightness.unwrap_or(40),
             debug: args.debug,
             start_with_windows: false,
-            module: "right".to_string(),
         };
         (s, None)
     } else {
@@ -89,11 +93,39 @@ fn main() -> Result<()> {
         }
     };
 
+    // Allocate a visible console when debug mode is active (release builds hide it)
+    #[cfg(windows)]
+    if settings.debug {
+        unsafe {
+            let _ = windows::Win32::System::Console::AllocConsole();
+        }
+    }
+
     // Apply startup registry when using a settings file
     #[cfg(windows)]
     if let Some(ref sp) = settings_path {
         if let Err(e) = settings.apply_startup_registry(sp) {
             eprintln!("Warning: could not update startup registry: {}", e);
+        }
+    }
+
+    // --- Module calibration check ---
+    let mut settings = settings;
+    let detected = led_matrix::detect_modules();
+    let detected_serials: Vec<String> = detected.iter().map(|(_, sn)| sn.clone()).collect();
+
+    #[cfg(windows)]
+    if detected.len() >= 2 && settings.needs_calibration(&detected_serials) {
+        if let Some(ref sp) = settings_path {
+            println!("Module calibration needed...");
+            calibration::run_calibration(&detected, &mut settings, sp)?;
+        }
+    }
+    // Single module auto-assign (no dialog needed)
+    if detected.len() == 1 && settings.right_serial.is_empty() {
+        settings.right_serial = detected_serials[0].clone();
+        if let Some(ref sp) = settings_path {
+            let _ = settings.save(sp);
         }
     }
 
@@ -103,6 +135,8 @@ fn main() -> Result<()> {
     let mut matrix = LedMatrix::new_with_brightness(
         brightness_atomic.clone(),
         settings.dual_mode,
+        &settings.left_serial,
+        &settings.right_serial,
         &settings.module,
         DEFAULT_GRID_HEIGHT,
     )?;

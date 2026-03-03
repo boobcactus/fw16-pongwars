@@ -69,42 +69,72 @@ impl MatrixPort {
 }
 
 /// Enumerate connected Framework LED Matrix modules without opening ports.
-/// Returns a vec of `(com_port_name, position)` where position is `"left"` or `"right"`.
-/// With a single module, it is labelled `"right"` (the more common slot).
+/// Returns a vec of `(com_port_name, usb_serial_number)` pairs.
 pub fn detect_modules() -> Vec<(String, String)> {
-    let mut candidates: Vec<serialport::SerialPortInfo> = serialport::available_ports()
+    let candidates: Vec<serialport::SerialPortInfo> = serialport::available_ports()
         .unwrap_or_default()
         .into_iter()
         .filter(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(ref info) if info.vid == 0x32AC && (info.pid == 0x0020 || info.pid == 0x0021)))
         .collect();
 
-    candidates.sort_by(|a, b| {
-        let sa = match &a.port_type {
-            serialport::SerialPortType::UsbPort(info) => info.serial_number.as_deref(),
-            _ => None,
+    candidates.into_iter().map(|p| {
+        let sn = match &p.port_type {
+            serialport::SerialPortType::UsbPort(info) => {
+                info.serial_number.clone().unwrap_or_default()
+            }
+            _ => String::new(),
         };
-        let sb = match &b.port_type {
-            serialport::SerialPortType::UsbPort(info) => info.serial_number.as_deref(),
-            _ => None,
-        };
-        match (sa, sb) {
-            (Some(aa), Some(bb)) => aa.cmp(bb),
-            (Some(_), None) => std::cmp::Ordering::Less,
-            (None, Some(_)) => std::cmp::Ordering::Greater,
-            (None, None) => a.port_name.cmp(&b.port_name),
-        }
-    });
+        (p.port_name, sn)
+    }).collect()
+}
 
-    candidates.truncate(2);
+/// Find the COM port name for a module with the given USB serial number.
+fn find_port_for_serial(serial: &str) -> Option<String> {
+    detect_modules().into_iter()
+        .find(|(_, sn)| sn == serial)
+        .map(|(port, _)| port)
+}
 
-    match candidates.len() {
-        0 => vec![],
-        1 => vec![(candidates[0].port_name.clone(), "right".to_string())],
-        _ => vec![
-            (candidates[0].port_name.clone(), "right".to_string()),
-            (candidates[1].port_name.clone(), "left".to_string()),
-        ],
-    }
+/// Open a single module's serial port by its USB serial number.
+/// Returns the opened port handle, or an error.
+pub fn open_port_by_serial(serial: &str) -> Result<Box<dyn SerialPort>> {
+    let port_name = find_port_for_serial(serial)
+        .ok_or_else(|| anyhow!("Module with serial {} not found", serial))?;
+    let port = serialport::new(&port_name, BAUD_RATE)
+        .timeout(Duration::from_millis(TIMEOUT_MS))
+        .data_bits(DataBits::Eight)
+        .parity(Parity::None)
+        .stop_bits(StopBits::One)
+        .open()
+        .map_err(|e| anyhow!("Failed opening {}: {}", port_name, e))?;
+    Ok(Box::from(port))
+}
+
+/// Light up all LEDs on a module at the given brightness (0-255).
+pub fn flash_module(port: &mut Box<dyn SerialPort>, brightness: u8) -> Result<()> {
+    let bright_cmd = [MAGIC_WORD[0], MAGIC_WORD[1], CMD_BRIGHTNESS, brightness];
+    let mut full_frame = [0xFFu8; 42];
+    full_frame[0] = MAGIC_WORD[0];
+    full_frame[1] = MAGIC_WORD[1];
+    full_frame[2] = CMD_DRAW_BW;
+    // bytes 3..42 are already 0xFF (all LEDs on)
+    port.write_all(&bright_cmd)?;
+    port.write_all(&full_frame)?;
+    port.flush()?;
+    Ok(())
+}
+
+/// Turn off all LEDs on a module.
+pub fn blank_module(port: &mut Box<dyn SerialPort>) -> Result<()> {
+    let bright_off = [MAGIC_WORD[0], MAGIC_WORD[1], CMD_BRIGHTNESS, 0];
+    let mut blank_frame = [0u8; 42];
+    blank_frame[0] = MAGIC_WORD[0];
+    blank_frame[1] = MAGIC_WORD[1];
+    blank_frame[2] = CMD_DRAW_BW;
+    port.write_all(&bright_off)?;
+    port.write_all(&blank_frame)?;
+    port.flush()?;
+    Ok(())
 }
 
 pub struct LedMatrix {
@@ -115,7 +145,9 @@ pub struct LedMatrix {
     last_recovery_attempt: Instant,
     resume_flag: Arc<AtomicBool>,
     suspend_sync: Arc<SuspendSync>,
-    preferred_module: String,
+    left_serial: String,
+    right_serial: String,
+    preferred_side: String,
     width: usize,
     height: usize,
     fade_remaining: u16,
@@ -123,75 +155,77 @@ pub struct LedMatrix {
 }
 
 impl LedMatrix {
-    pub fn new_with_brightness(brightness: Arc<AtomicU8>, dual_mode: bool, preferred_module: &str, height: usize) -> Result<Self> {
-        let mut candidates: Vec<serialport::SerialPortInfo> = serialport::available_ports()?
-            .into_iter()
-            .filter(|p| matches!(p.port_type, serialport::SerialPortType::UsbPort(ref info) if info.vid == 0x32AC && (info.pid == 0x0020 || info.pid == 0x0021)))
-            .collect();
-
-        if candidates.is_empty() {
+    pub fn new_with_brightness(
+        brightness: Arc<AtomicU8>,
+        dual_mode: bool,
+        left_serial: &str,
+        right_serial: &str,
+        preferred_side: &str,
+        height: usize,
+    ) -> Result<Self> {
+        let detected = detect_modules();
+        if detected.is_empty() {
             return Err(anyhow!("No Framework LED Matrix modules found."));
         }
 
-        candidates.sort_by(|a, b| {
-            let sa = match &a.port_type {
-                serialport::SerialPortType::UsbPort(info) => info.serial_number.as_deref(),
-                _ => None,
-            };
-            let sb = match &b.port_type {
-                serialport::SerialPortType::UsbPort(info) => info.serial_number.as_deref(),
-                _ => None,
-            };
-            match (sa, sb) {
-                (Some(aa), Some(bb)) => aa.cmp(bb),
-                (Some(_), None) => std::cmp::Ordering::Less,
-                (None, Some(_)) => std::cmp::Ordering::Greater,
-                (None, None) => a.port_name.cmp(&b.port_name),
+        // Build the ordered list of port names to open.
+        // In dual mode: [left_port, right_port]  (port index 0 = left columns, 1 = right).
+        // In single mode: [chosen_port].
+        let port_names: Vec<String> = if dual_mode {
+            let left_port = detected.iter()
+                .find(|(_, sn)| sn == left_serial)
+                .map(|(p, _)| p.clone());
+            let right_port = detected.iter()
+                .find(|(_, sn)| sn == right_serial)
+                .map(|(p, _)| p.clone());
+            match (left_port, right_port) {
+                (Some(l), Some(r)) => {
+                    println!("Dual mode: left={} right={}", l, r);
+                    vec![l, r]
+                }
+                _ if detected.len() >= 2 => {
+                    // Fallback: serials not calibrated, use first two detected modules
+                    println!(
+                        "Dual mode (uncalibrated): using {} and {}",
+                        detected[0].0, detected[1].0
+                    );
+                    vec![detected[0].0.clone(), detected[1].0.clone()]
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Dual mode requested but fewer than 2 modules detected."
+                    ));
+                }
             }
-        });
-
-        let mut desired_ports = if dual_mode {
-            if candidates.len() < 2 {
-                return Err(anyhow!("Dual mode requested but only {} LED Matrix module detected.", candidates.len()));
-            }
-            candidates.truncate(2);
-            candidates
-        } else if candidates.len() >= 2 {
-            // Two modules detected in single mode — pick based on preference
-            candidates.truncate(2);
-            let idx = if preferred_module == "left" { 1 } else { 0 };
-            println!(
-                "Single mode: selected {} module on {}",
-                preferred_module, candidates[idx].port_name
-            );
-            vec![candidates.remove(idx)]
         } else {
-            candidates.truncate(1);
-            candidates
+            // Single mode: pick by preferred side
+            let target_serial = if preferred_side == "left" { left_serial } else { right_serial };
+            if let Some((port, _)) = detected.iter().find(|(_, sn)| sn == target_serial) {
+                println!("Single mode: using {} side on {}", preferred_side, port);
+                vec![port.clone()]
+            } else if let Some((port, sn)) = detected.first() {
+                // Fallback: use whatever is available
+                println!("Single mode: preferred module not found, falling back to {} ({})", port, sn);
+                vec![port.clone()]
+            } else {
+                return Err(anyhow!("No Framework LED Matrix modules found."));
+            }
         };
-
-        if dual_mode && desired_ports.len() == 2 {
-            desired_ports.reverse();
-            println!(
-                "Auto-ordered modules: {} = left, {} = right",
-                desired_ports[0].port_name, desired_ports[1].port_name
-            );
-        }
 
         // Phase 1: Open every port and immediately quench brightness so stale
         //          framebuffer content is hidden before any slow per-port init.
         let brightness_off = [MAGIC_WORD[0], MAGIC_WORD[1], CMD_BRIGHTNESS, 0];
         let mut raw_ports: Vec<(String, Box<dyn SerialPort>)> = Vec::new();
-        for info in &desired_ports {
-            match serialport::new(&info.port_name, BAUD_RATE)
+        for name in &port_names {
+            match serialport::new(name, BAUD_RATE)
                 .timeout(Duration::from_millis(TIMEOUT_MS))
                 .data_bits(DataBits::Eight)
                 .parity(Parity::None)
                 .stop_bits(StopBits::One)
                 .open()
             {
-                Ok(port) => raw_ports.push((info.port_name.clone(), Box::from(port))),
-                Err(e) => eprintln!("Failed opening port {}: {}", info.port_name, e),
+                Ok(port) => raw_ports.push((name.clone(), Box::from(port))),
+                Err(e) => eprintln!("Failed opening port {}: {}", name, e),
             }
         }
         for (_, port) in &mut raw_ports {
@@ -251,7 +285,9 @@ impl LedMatrix {
             last_recovery_attempt: Instant::now(),
             resume_flag: Arc::new(AtomicBool::new(false)),
             suspend_sync: SuspendSync::new(),
-            preferred_module: preferred_module.to_string(),
+            left_serial: left_serial.to_string(),
+            right_serial: right_serial.to_string(),
+            preferred_side: preferred_side.to_string(),
             fade_remaining: FADE_FRAMES,
             reconnected_flag: false,
         })
@@ -291,7 +327,9 @@ impl LedMatrix {
 
     fn try_reconnect(&mut self) -> Result<()> {
         let dual_mode = self.width > MODULE_WIDTH;
-        let preferred = self.preferred_module.clone();
+        let left_serial = self.left_serial.clone();
+        let right_serial = self.right_serial.clone();
+        let preferred_side = self.preferred_side.clone();
         // Drop old port handles so the OS can release them
         self.ports.clear();
         thread::sleep(Duration::from_millis(500));
@@ -299,7 +337,9 @@ impl LedMatrix {
         let brightness = self.brightness.clone();
         let resume_flag = self.resume_flag.clone();
         let suspend_sync = self.suspend_sync.clone();
-        let new_matrix = Self::new_with_brightness(brightness, dual_mode, &preferred, self.height)?;
+        let new_matrix = Self::new_with_brightness(
+            brightness, dual_mode, &left_serial, &right_serial, &preferred_side, self.height
+        )?;
         *self = new_matrix;
         self.resume_flag = resume_flag;
         self.suspend_sync = suspend_sync;

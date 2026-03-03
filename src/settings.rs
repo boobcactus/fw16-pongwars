@@ -5,29 +5,49 @@ use std::path::Path;
 #[serde(default)]
 pub struct Settings {
     pub dual_mode: bool,
+    pub left_serial: String,
+    pub right_serial: String,
+    pub module: String,
     pub balls: u8,
     pub speed: u8,
     pub brightness: u8,
     pub debug: bool,
     pub start_with_windows: bool,
-    pub module: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             dual_mode: false,
+            left_serial: String::new(),
+            right_serial: String::new(),
+            module: "right".to_string(),
             balls: 2,
             speed: 32,
             brightness: 40,
             debug: false,
             start_with_windows: true,
-            module: "right".to_string(),
         }
     }
 }
 
 impl Settings {
+    /// Returns true when a calibration run is needed.
+    /// Triggers when: no serials stored, or stored serials don't match detected hardware.
+    pub fn needs_calibration(&self, detected_serials: &[String]) -> bool {
+        // No serials stored at all — first run
+        if self.left_serial.is_empty() && self.right_serial.is_empty() {
+            return true;
+        }
+        // Check that every non-empty stored serial is present in detected hardware
+        for stored in [&self.left_serial, &self.right_serial] {
+            if !stored.is_empty() && !detected_serials.contains(stored) {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Load from path. If file doesn't exist, create it with defaults.
     pub fn load_or_create(path: &Path) -> anyhow::Result<Self> {
         if path.exists() {
