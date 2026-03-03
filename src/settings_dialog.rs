@@ -282,11 +282,13 @@ mod windows_dialog {
                             // Two modules: show L/R prefixed serial numbers
                             let calibrated = !state.settings.left_serial.is_empty() && !state.settings.right_serial.is_empty();
                             if calibrated {
-                                let left_line = format!("L: {}", state.settings.left_serial);
-                                create_label(hwnd, &left_line, margin + 10, y + 3, 300, row_h);
+                                let prefix_w = 18;
+                                let serial_x = margin + 10 + prefix_w;
+                                create_label(hwnd, "L:", margin + 10, y + 3, prefix_w, row_h);
+                                create_label(hwnd, &state.settings.left_serial, serial_x, y + 3, 300 - prefix_w, row_h);
                                 y += row_h;
-                                let right_line = format!("R: {}", state.settings.right_serial);
-                                create_label(hwnd, &right_line, margin + 10, y + 3, 300, row_h);
+                                create_label(hwnd, "R:", margin + 10, y + 3, prefix_w, row_h);
+                                create_label(hwnd, &state.settings.right_serial, serial_x, y + 3, 300 - prefix_w, row_h);
                                 y += row_h + 4;
                             } else {
                                 y += 6;
