@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
@@ -33,9 +35,6 @@ struct Args {
 
     #[arg(long = "debug")]
     debug: bool,
-
-    #[arg(long = "hide-console", help = "Hide the console window (Windows only)")]
-    hide_console: bool,
 
     #[arg(long = "settings", help = "Path to persistent settings TOML file")]
     settings: Option<PathBuf>,
@@ -85,13 +84,6 @@ fn main() -> Result<()> {
     if let Some(ref sp) = settings_path {
         if let Err(e) = settings.apply_startup_registry(sp) {
             eprintln!("Warning: could not update startup registry: {}", e);
-        }
-    }
-
-    #[cfg(windows)]
-    if args.hide_console {
-        unsafe {
-            let _ = windows::Win32::System::Console::FreeConsole();
         }
     }
 

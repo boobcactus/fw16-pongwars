@@ -40,7 +40,6 @@ fw16-pongwars-portable.exe --dualmode --speed 48 --balls 5 --brightness 10
 | `-s`, `--speed <1-64>` | Target FPS (default 32) |
 | `-B`, `--brightness <0-100>` | Brightness percent (default 40) |
 | `--settings <path>` | Path to persistent settings TOML file (cannot be combined with game flags) |
-| `--hide-console` | Detach and hide the console window |
 | `--debug` | Extra timing and log output |
 
 ### System Tray

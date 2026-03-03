@@ -64,7 +64,7 @@ impl Settings {
         if self.start_with_windows {
             let exe = std::env::current_exe()?;
             let cmd = format!(
-                "\"{}\" --hide-console --settings=\"{}\"",
+                "\"{}\" --settings=\"{}\"",
                 exe.display(),
                 settings_path.display()
             );
