@@ -1,0 +1,6 @@
+dual_mode = false
+balls = 2
+speed = 32
+brightness = 40
+debug = false
+start_with_windows = true

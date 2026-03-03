@@ -13,6 +13,9 @@ https://github.com/user-attachments/assets/2d7a4b85-f580-4dbc-9378-3473213b643f
 ### Pre-built binary
 Download `fw16-pongwars-portable.exe` from the latest release. The executable is fully portable — no Visual C++ Redistributable or other runtime dependencies required.
 
+### Installer
+Download the NSIS installer (`FW16_Pong_Wars_x64-setup.exe`) from the latest release. It installs the app to `%LOCALAPPDATA%\FW16 Pong Wars`, creates a desktop shortcut, and uses a settings file at `%APPDATA%\FW16PongWars\settings.toml`.
+
 ### Build from source
 Requires the Rust toolchain (stable).
 
@@ -34,15 +37,25 @@ fw16-pongwars-portable.exe --dualmode --speed 48 --balls 5 --brightness 10
 |------|-------------|
 | `-d`, `--dualmode` | Drive two modules side-by-side (18×34) |
 | `-b`, `--balls [1-20]` | Balls per team (defaults to 2 if flag is passed without a value) |
-| `-s`, `--speed <1-64>` | Target FPS (default 64) |
-| `-B`, `--brightness <0-100>` | Brightness percent (default 50) |
-| `--install` | Register as a Windows startup application (with current flags) |
-| `--uninstall` | Remove the Windows startup entry |
+| `-s`, `--speed <1-64>` | Target FPS (default 32) |
+| `-B`, `--brightness <0-100>` | Brightness percent (default 40) |
+| `--settings <path>` | Path to persistent settings TOML file (cannot be combined with game flags) |
 | `--hide-console` | Detach and hide the console window |
 | `--debug` | Extra timing and log output |
 
 ### System Tray
-On Windows the app places an icon in the system tray with **Pause**, **Reset Game**, and **Exit** controls.
+On Windows the app places an icon in the system tray with **Pause**, **Reset Game**, and **Exit** controls. When running with `--settings`, a **Settings** menu item also appears, opening a dialog to configure all game options and auto-start behavior.
+
+### Persistent Settings
+Use `--settings=path/to/settings.toml` to enable persistent configuration. If the file doesn't exist it will be created with defaults (balls=2, speed=32, brightness=40, start_with_windows=true). The `--settings` flag is mutually exclusive with `-b`, `-s`, `-B`, and `-d`.
+
+### Building the Installer
+Requires `cargo-packager`:
+```powershell
+cargo install cargo-packager --locked
+cargo packager --release --formats nsis
+```
+The installer `.exe` will be placed in the output directory.
 
 ### Power Management
 The app automatically blanks the display on suspend and reconnects the LED Matrix on resume — no user intervention needed. If a module is disconnected while running, it will periodically attempt to reconnect.
