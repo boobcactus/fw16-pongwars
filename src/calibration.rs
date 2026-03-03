@@ -56,12 +56,12 @@ mod windows_calibration {
         let mut port_b = led_matrix::open_port_by_serial(serial_b)?;
 
         // Blank both first
-        let _ = led_matrix::blank_module(&mut port_a);
-        let _ = led_matrix::blank_module(&mut port_b);
+        led_matrix::blank_module(&mut port_a)?;
+        led_matrix::blank_module(&mut port_b)?;
         thread::sleep(Duration::from_millis(200));
 
         // Flash module A at 60% brightness (0.6 * 255 ≈ 153)
-        let _ = led_matrix::flash_module(&mut port_a, 153);
+        led_matrix::flash_module(&mut port_a, 153)?;
 
         // Ask the user
         let msg_text: Vec<u16> = "A module is now lit up.\nIs this your LEFT module?"
@@ -119,7 +119,10 @@ mod windows_calibration {
         let a_is_left = result == MESSAGEBOX_RESULT(6); // IDYES = 6
 
         // Blank module A
-        let _ = led_matrix::blank_module(&mut port_a);
+        led_matrix::blank_module(&mut port_a)?;
+
+        // Default to dual mode when two modules are installed
+        settings.dual_mode = true;
 
         if a_is_left {
             settings.left_serial = serial_a.clone();
@@ -132,9 +135,9 @@ mod windows_calibration {
         }
 
         // Confirmation flash: briefly light up the OTHER module (now identified)
-        let _ = led_matrix::flash_module(&mut port_b, 153);
+        led_matrix::flash_module(&mut port_b, 153)?;
         thread::sleep(Duration::from_millis(500));
-        let _ = led_matrix::blank_module(&mut port_b);
+        led_matrix::blank_module(&mut port_b)?;
 
         // Close ports before the game opens them
         drop(port_a);

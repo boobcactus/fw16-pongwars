@@ -107,6 +107,8 @@ pub fn open_port_by_serial(serial: &str) -> Result<Box<dyn SerialPort>> {
         .stop_bits(StopBits::One)
         .open()
         .map_err(|e| anyhow!("Failed opening {}: {}", port_name, e))?;
+    let _ = port.clear(serialport::ClearBuffer::All);
+    thread::sleep(Duration::from_millis(100));
     Ok(Box::from(port))
 }
 

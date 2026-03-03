@@ -21,7 +21,6 @@ mod windows_dialog {
     const ID_BRIGHTNESS_UPDOWN: i32 = 107;
     const ID_DEBUG_CHECK: i32 = 108;
     const ID_STARTUP_CHECK: i32 = 109;
-    const ID_CALIBRATION_LABEL: i32 = 110;
     const ID_MODULE_LEFT_RADIO: i32 = 111;
     const ID_MODULE_RIGHT_RADIO: i32 = 112;
     const ID_RECALIBRATE_BTN: i32 = 113;
@@ -34,7 +33,6 @@ mod windows_dialog {
     const BS_PUSHBUTTON: u32 = 0x0000;
     const BS_AUTORADIOBUTTON: u32 = 0x0009;
     const ES_NUMBER: u32 = 0x2000;
-    const SS_LEFT: u32 = 0x0000;
     const BN_CLICKED: u32 = 0;
 
     // UpDown control messages
@@ -262,7 +260,7 @@ mod windows_dialog {
                     let row_h = 26i32;
                     let mut y = 15i32;
 
-                    // Only show multi-module UI when 2+ modules are detected
+                    // Detect installed modules
                     let module_count = crate::led_matrix::detect_modules().len();
                     let multi_module = module_count >= 2;
 
@@ -270,32 +268,48 @@ mod windows_dialog {
                         create_checkbox(hwnd, "Dual Mode", margin, y, 200, row_h,
                             ID_DUALMODE_CHECK, state.settings.dual_mode);
                         y += row_h + 10;
+                    }
 
-                        // --- Calibration status ---
-                        let cal_text = if !state.settings.left_serial.is_empty() && !state.settings.right_serial.is_empty() {
-                            let l_suffix = state.settings.left_serial.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>();
-                            let r_suffix = state.settings.right_serial.chars().rev().take(4).collect::<String>().chars().rev().collect::<String>();
-                            format!("Calibrated: L=...{} R=...{}", l_suffix, r_suffix)
-                        } else {
-                            "Not calibrated".to_string()
-                        };
-                        {
-                            let label_text = wide(&cal_text);
-                            let _ = CreateWindowExW(
-                                WINDOW_EX_STYLE::default(),
-                                w!("STATIC"),
-                                PCWSTR(label_text.as_ptr()),
-                                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(SS_LEFT),
-                                margin, y + 3, 200, row_h,
-                                hwnd,
-                                hmenu_from_id(ID_CALIBRATION_LABEL),
-                                HINSTANCE::default(),
-                                None,
-                            );
+                    if module_count >= 1 {
+                        // --- Installed Modules section ---
+                        create_label(hwnd, "Installed Modules:", margin, y + 3, 200, row_h);
+                        if multi_module {
+                            create_button(hwnd, "Recalibrate", margin + 210, y, 100, row_h, ID_RECALIBRATE_BTN);
                         }
-                        create_button(hwnd, "Recalibrate", margin + 210, y, 100, row_h, ID_RECALIBRATE_BTN);
-                        y += row_h + 10;
+                        y += row_h + 2;
 
+                        if multi_module {
+                            // Two modules: show L/R prefixed serial numbers
+                            let calibrated = !state.settings.left_serial.is_empty() && !state.settings.right_serial.is_empty();
+                            if calibrated {
+                                let left_line = format!("L: {}", state.settings.left_serial);
+                                create_label(hwnd, &left_line, margin + 10, y + 3, 300, row_h);
+                                y += row_h;
+                                let right_line = format!("R: {}", state.settings.right_serial);
+                                create_label(hwnd, &right_line, margin + 10, y + 3, 300, row_h);
+                                y += row_h + 4;
+                            } else {
+                                y += 6;
+                            }
+                        } else {
+                            // Single module: show serial without L/R prefix
+                            let serial = if !state.settings.right_serial.is_empty() {
+                                &state.settings.right_serial
+                            } else if !state.settings.left_serial.is_empty() {
+                                &state.settings.left_serial
+                            } else {
+                                ""
+                            };
+                            if !serial.is_empty() {
+                                create_label(hwnd, serial, margin + 10, y + 3, 300, row_h);
+                                y += row_h + 4;
+                            } else {
+                                y += 6;
+                            }
+                        }
+                    }
+
+                    if multi_module {
                         // --- Module side picker (visible when dual mode is off) ---
                         let side_style = if state.settings.dual_mode {
                             WS_CHILD
@@ -396,6 +410,19 @@ mod windows_dialog {
                     }
                     let _ = EnumChildWindows(hwnd, Some(set_font_callback), LPARAM(font.0 as isize));
 
+                    // Poll the shutdown flag so tray "Exit" can close this window
+                    let _ = SetTimer(hwnd, 1, 200, None);
+
+                    LRESULT(0)
+                }
+                WM_TIMER => {
+                    let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogState;
+                    if !state_ptr.is_null() {
+                        let state = &*state_ptr;
+                        if state.shutdown.load(Ordering::Relaxed) {
+                            let _ = DestroyWindow(hwnd);
+                        }
+                    }
                     LRESULT(0)
                 }
                 WM_COMMAND => {
@@ -493,6 +520,7 @@ mod windows_dialog {
                     LRESULT(0)
                 }
                 WM_DESTROY => {
+                    let _ = KillTimer(hwnd, 1);
                     let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut DialogState;
                     if !state_ptr.is_null() {
                         let _ = Box::from_raw(state_ptr);

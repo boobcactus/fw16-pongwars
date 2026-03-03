@@ -14,6 +14,8 @@ mod windows_tray {
 
     use crate::settings::Settings;
 
+    static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
+
     const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");
 
     fn load_icon() -> Icon {
@@ -86,9 +88,15 @@ mod windows_tray {
                 } else if event.id() == reset_item.id() {
                     reset_requested.store(true, Ordering::Release);
                 } else if let Some(ref si) = settings_item {
-                    if event.id() == si.id() {
+                    if event.id() == si.id() && !SETTINGS_OPEN.load(Ordering::Relaxed) {
                         if let Some(ref sp) = settings_path {
-                            crate::settings_dialog::show_settings_dialog(&settings, sp, shutdown, restart_pending);
+                            SETTINGS_OPEN.store(true, Ordering::Release);
+                            let s = settings.clone();
+                            let p = sp.clone();
+                            std::thread::spawn(move || {
+                                crate::settings_dialog::show_settings_dialog(&s, &p, shutdown, restart_pending);
+                                SETTINGS_OPEN.store(false, Ordering::Release);
+                            });
                         }
                     }
                 }
