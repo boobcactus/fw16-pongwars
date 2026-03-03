@@ -1,5 +1,6 @@
 #[cfg(windows)]
 mod windows_tray {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -10,6 +11,8 @@ mod windows_tray {
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE,
     };
+
+    use crate::settings::Settings;
 
     const ICON_BYTES: &[u8] = include_bytes!("../assets/icon.ico");
 
@@ -26,6 +29,9 @@ mod windows_tray {
         shutdown: &'static AtomicBool,
         paused: &'static AtomicBool,
         reset_requested: &'static AtomicBool,
+        restart_pending: &'static AtomicBool,
+        settings_path: Option<PathBuf>,
+        settings: Settings,
     ) {
         let icon = load_icon();
 
@@ -38,6 +44,17 @@ mod windows_tray {
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&reset_item);
         let _ = menu.append(&PredefinedMenuItem::separator());
+
+        // Only show Settings when a settings file path is available
+        let settings_item = if settings_path.is_some() {
+            let item = MenuItem::new("Settings", true, None);
+            let _ = menu.append(&item);
+            let _ = menu.append(&PredefinedMenuItem::separator());
+            Some(item)
+        } else {
+            None
+        };
+
         let _ = menu.append(&exit_item);
 
         let _tray = TrayIconBuilder::new()
@@ -68,7 +85,14 @@ mod windows_tray {
                     pause_item.set_text(if is_paused { "Resume" } else { "Pause" });
                 } else if event.id() == reset_item.id() {
                     reset_requested.store(true, Ordering::Release);
-                } else if event.id() == exit_item.id() {
+                } else if let Some(ref si) = settings_item {
+                    if event.id() == si.id() {
+                        if let Some(ref sp) = settings_path {
+                            crate::settings_dialog::show_settings_dialog(&settings, sp, shutdown, restart_pending);
+                        }
+                    }
+                }
+                if event.id() == exit_item.id() {
                     shutdown.store(true, Ordering::Release);
                 }
             }
