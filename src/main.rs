@@ -1,11 +1,21 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::Result;
 use clap::Parser;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+mod calibration;
 mod game;
 mod led_matrix;
+mod power;
+mod settings;
+#[cfg(windows)]
+mod settings_dialog;
+mod tray;
 
 use game::{GameState, DEFAULT_GRID_HEIGHT};
 use led_matrix::LedMatrix;
@@ -19,14 +29,22 @@ struct Args {
     #[arg(short = 'b', long = "balls", num_args = 0..=1, default_missing_value = "2", value_parser = clap::value_parser!(u8).range(1..=20))]
     balls: Option<u8>,
 
-    #[arg(short = 's', long = "speed", default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
-    speed: u8,
+    #[arg(short = 's', long = "speed", value_parser = clap::value_parser!(u8).range(1..=64))]
+    speed: Option<u8>,
 
-    #[arg(short = 'B', long = "brightness", default_value_t = 50, value_parser = clap::value_parser!(u8).range(0..=100))]
-    brightness: u8,
+    #[arg(short = 'B', long = "brightness", value_parser = clap::value_parser!(u8).range(0..=100))]
+    brightness: Option<u8>,
 
     #[arg(long = "debug")]
     debug: bool,
+
+    #[arg(long = "settings", help = "Path to persistent settings TOML file")]
+    settings: Option<PathBuf>,
+}
+
+fn has_explicit_game_flags(args: &Args) -> bool {
+    args.dual_mode || args.balls.is_some() || args.speed.is_some()
+        || args.brightness.is_some() || args.debug
 }
 
 fn percent_to_led_value(percent: u8) -> u8 {
@@ -36,37 +54,158 @@ fn percent_to_led_value(percent: u8) -> u8 {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let brightness_value = percent_to_led_value(args.brightness);
+    // Enforce mutual exclusion: --settings vs game flags
+    if args.settings.is_some() && has_explicit_game_flags(&args) {
+        eprintln!("Error: --settings cannot be combined with --dualmode, --balls, --speed, --brightness, or --debug flags.");
+        std::process::exit(1);
+    }
+
+    // Resolve effective settings via three modes
+    let (settings, settings_path) = if let Some(ref path) = args.settings {
+        // Mode 1: --settings file (load or create with defaults)
+        let s = settings::Settings::load_or_create(path)?;
+        (s, Some(path.clone()))
+    } else if has_explicit_game_flags(&args) {
+        // Mode 2: explicit CLI flags
+        let s = settings::Settings {
+            dual_mode: args.dual_mode,
+            left_serial: String::new(),
+            right_serial: String::new(),
+            module: "right".to_string(),
+            balls: args.balls.unwrap_or(2),
+            speed: args.speed.unwrap_or(32),
+            brightness: args.brightness.unwrap_or(40),
+            debug: args.debug,
+            start_with_windows: false,
+        };
+        (s, None)
+    } else {
+        // Mode 3: bare run — use settings.toml next to the executable
+        let default_path = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(|p| p.join("settings.toml")));
+        match default_path {
+            Some(ref path) => {
+                let s = settings::Settings::load_or_create(path)?;
+                (s, Some(path.clone()))
+            }
+            None => (settings::Settings::default(), None),
+        }
+    };
+
+    // Allocate a visible console when debug mode is active (release builds hide it)
+    #[cfg(windows)]
+    if settings.debug {
+        unsafe {
+            let _ = windows::Win32::System::Console::AllocConsole();
+        }
+    }
+
+    // Apply startup registry when using a settings file
+    #[cfg(windows)]
+    if let Some(ref sp) = settings_path {
+        if let Err(e) = settings.apply_startup_registry(sp) {
+            eprintln!("Warning: could not update startup registry: {}", e);
+        }
+    }
+
+    // --- Module calibration check ---
+    let mut settings = settings;
+    let detected = led_matrix::detect_modules();
+    let detected_serials: Vec<String> = detected.iter().map(|(_, sn)| sn.clone()).collect();
+
+    #[cfg(windows)]
+    if detected.len() >= 2 && settings.needs_calibration(&detected_serials) {
+        if let Some(ref sp) = settings_path {
+            println!("Module calibration needed...");
+            calibration::run_calibration(&detected, &mut settings, sp)?;
+        }
+    }
+    // Single module auto-assign (no dialog needed)
+    if detected.len() == 1 && settings.right_serial.is_empty() {
+        settings.right_serial = detected_serials[0].clone();
+        if let Some(ref sp) = settings_path {
+            let _ = settings.save(sp);
+        }
+    }
+
+    let brightness_value = percent_to_led_value(settings.brightness);
     let brightness_atomic = Arc::new(AtomicU8::new(brightness_value));
 
     let mut matrix = LedMatrix::new_with_brightness(
         brightness_atomic.clone(),
-        args.dual_mode,
+        settings.dual_mode,
+        &settings.left_serial,
+        &settings.right_serial,
+        &settings.module,
         DEFAULT_GRID_HEIGHT,
     )?;
-    matrix.set_brightness(brightness_value)?;
+
+    let resume_flag = matrix.resume_flag();
+    let suspend_sync = matrix.suspend_sync();
+    #[cfg(windows)]
+    let _power_guard = match power::register_power_notification(resume_flag, suspend_sync) {
+        Ok(guard) => {
+            println!("Registered Windows power notification (suspend + resume).");
+            Some(guard)
+        }
+        Err(e) => {
+            eprintln!("Warning: could not register power notification: {}", e);
+            None
+        }
+    };
+    #[cfg(not(windows))]
+    let _ = (resume_flag, suspend_sync);
 
     let width = matrix.width();
     let max_fps = matrix.estimated_max_fps() as u8;
-    let effective_fps = args.speed.min(max_fps).max(1);
+    let effective_fps = settings.speed.min(max_fps).max(1);
     println!(
         "Starting Pong Wars (width={} height={} speed={}fps brightness={}%)",
-        width, DEFAULT_GRID_HEIGHT, effective_fps, args.brightness
+        width, DEFAULT_GRID_HEIGHT, effective_fps, settings.brightness
     );
 
     ctrlc::set_handler(|| {
         println!("Received interrupt, shutting down...");
-        SHUTDOWN.store(true, Ordering::SeqCst);
+        SHUTDOWN.store(true, Ordering::Release);
     })?;
 
-    let balls_per_team: u8 = args.balls.unwrap_or(1);
-    run_game_loop(&mut matrix, effective_fps, brightness_atomic, args.debug, balls_per_team)?;
+    #[cfg(windows)]
+    let tray_handle = {
+        let sp = settings_path.clone();
+        let st = settings.clone();
+        std::thread::spawn(move || {
+            tray::run_tray(&SHUTDOWN, &PAUSED, &RESET_REQUESTED, &RESTART_PENDING, sp, st);
+        })
+    };
+
+    let balls_per_team: u8 = settings.balls;
+    run_game_loop(&mut matrix, effective_fps, brightness_atomic, settings.debug, balls_per_team)?;
+
+    #[cfg(windows)]
+    let _ = tray_handle.join();
+
+    // Drop matrix before restart so serial ports are released
+    drop(matrix);
+
+    if RESTART_PENDING.load(Ordering::Relaxed) {
+        if let (Ok(exe), Some(sp)) = (std::env::current_exe(), &settings_path) {
+            println!("Restarting...");
+            let _ = std::process::Command::new(exe)
+                .arg("--settings")
+                .arg(sp)
+                .spawn();
+        }
+    }
 
     println!("Exited cleanly.");
     Ok(())
 }
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+static PAUSED: AtomicBool = AtomicBool::new(false);
+static RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
+static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn run_game_loop(
     matrix: &mut LedMatrix,
@@ -83,8 +222,8 @@ fn run_game_loop(
     let mut last_frame_start = next_frame_time;
     let mut frame_index: u64 = 0;
 
-    let mut last_sent_brightness = brightness.load(Ordering::SeqCst);
-    while !SHUTDOWN.load(Ordering::SeqCst) {
+    let mut last_sent_brightness = brightness.load(Ordering::Relaxed);
+    while !SHUTDOWN.load(Ordering::Relaxed) {
         let now = Instant::now();
 
         if now >= next_frame_time {
@@ -97,13 +236,24 @@ fn run_game_loop(
                 );
             }
 
-            game_state.update();
+            if RESET_REQUESTED.swap(false, Ordering::Relaxed) {
+                game_state = GameState::new(width, DEFAULT_GRID_HEIGHT, balls_per_team);
+            }
+
+            if !PAUSED.load(Ordering::Relaxed) {
+                game_state.update();
+            }
 
             if let Err(e) = matrix.render(&game_state) {
                 eprintln!("Render error: {}", e);
                 std::thread::sleep(Duration::from_millis(10));
             }
 
+            if matrix.just_reconnected() {
+                game_state.reset_kickoff();
+            }
+
+            let now = Instant::now();
             let scheduled_next = next_frame_time + frame_duration;
             if now.saturating_duration_since(next_frame_time) > frame_duration {
                 next_frame_time = now + frame_duration;
@@ -115,7 +265,7 @@ fn run_game_loop(
         } else {
             let sleep_duration = next_frame_time.saturating_duration_since(now);
 
-            if let Some(coarse_sleep) = sleep_duration.checked_sub(Duration::from_millis(1)) {
+            if let Some(coarse_sleep) = sleep_duration.checked_sub(Duration::from_micros(500)) {
                 if debug {
                     println!(
                         "[debug] sleeping {:?} before spin (coarse={:?})",
@@ -137,7 +287,7 @@ fn run_game_loop(
             }
         }
 
-        let desired_brightness = brightness.load(Ordering::SeqCst);
+        let desired_brightness = brightness.load(Ordering::Relaxed);
         if desired_brightness != last_sent_brightness {
             matrix.set_brightness(desired_brightness)?;
             last_sent_brightness = desired_brightness;

@@ -1,10 +1,14 @@
-use rand::Rng;
+use rand::rngs::SmallRng;
+use rand::{Rng, SeedableRng};
 
 pub const DEFAULT_GRID_HEIGHT: usize = 34;
 
 const MIN_SPEED: f32 = 0.2;
 const MAX_SPEED: f32 = 0.5;
 const SPEED_RANDOMNESS: f32 = 0.001;
+
+const KICKOFF_HOLD_FRAMES: u16 = 24;
+const KICKOFF_RAMP_FRAMES: u16 = 16;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum SquareColor {
@@ -39,11 +43,12 @@ pub struct GameState {
     height: usize,
     width_f32: f32,
     height_f32: f32,
-    pub squares: Vec<Vec<SquareColor>>,
+    pub squares: Vec<SquareColor>,
+    back_buffer: Vec<SquareColor>,
     pub balls: Vec<Ball>,
-    pub day_score: usize,
-    pub night_score: usize,
-    pub rng: rand::rngs::ThreadRng,
+    rng: SmallRng,
+    kickoff_countdown: u16,
+    ramp_remaining: u16,
 }
 
 impl GameState {
@@ -55,14 +60,15 @@ impl GameState {
         let width_f32 = width as f32;
         let height_f32 = height as f32;
 
-        let mut squares = vec![vec![SquareColor::Day; height]; width];
-        for column in squares.iter_mut() {
+        let mut squares = vec![SquareColor::Day; width * height];
+        for x in 0..width {
             for y in 0..half_height {
-                column[y] = SquareColor::Night;
+                squares[x * height + y] = SquareColor::Night;
             }
         }
+        let back_buffer = squares.clone();
 
-        let mut rng = rand::thread_rng();
+        let mut rng = SmallRng::from_entropy();
         let base_speed = 0.3;
         
         let top_y = 2.0;
@@ -98,19 +104,17 @@ impl GameState {
             ));
         }
 
-        let day_score = half_height * width;
-        let night_score = half_height * width;
-
         GameState {
             width,
             height,
             width_f32,
             height_f32,
             squares,
+            back_buffer,
             balls,
-            day_score,
-            night_score,
             rng,
+            kickoff_countdown: KICKOFF_HOLD_FRAMES,
+            ramp_remaining: KICKOFF_RAMP_FRAMES,
         }
     }
 
@@ -124,44 +128,40 @@ impl GameState {
         self.height
     }
 
+    pub fn reset_kickoff(&mut self) {
+        self.kickoff_countdown = KICKOFF_HOLD_FRAMES;
+        self.ramp_remaining = KICKOFF_RAMP_FRAMES;
+    }
+
     #[inline]
     pub fn update(&mut self) {
-        let mut new_squares = self.squares.clone();
-        let mut day_score_delta = 0i32;
-        let mut night_score_delta = 0i32;
+        if self.kickoff_countdown > 0 {
+            self.kickoff_countdown -= 1;
+            return;
+        }
 
-        let original_balls = self.balls.clone();
-        let mut updated_balls = original_balls.clone();
+        let speed_scale = if self.ramp_remaining > 0 {
+            self.ramp_remaining -= 1;
+            (KICKOFF_RAMP_FRAMES - self.ramp_remaining) as f32 / KICKOFF_RAMP_FRAMES as f32
+        } else {
+            1.0
+        };
 
-        for (index, ball) in original_balls.iter().enumerate() {
-            let mut ball_state = *ball;
+        self.back_buffer.copy_from_slice(&self.squares);
+
+        for i in 0..self.balls.len() {
+            let mut ball_state = self.balls[i];
 
             if ball_state.x + ball_state.dx >= self.width_f32 - 0.5
                 || ball_state.x + ball_state.dx < 0.5
             {
-                let nx = if ball.x + ball.dx >= self.width_f32 - 0.5 {
-                    -1.0
-                } else {
-                    1.0
-                };
-                let ny = 0.0;
-                let dot_product = ball_state.dx * nx + ball_state.dy * ny;
-                ball_state.dx = ball_state.dx - 2.0 * dot_product * nx;
-                ball_state.dy = ball_state.dy - 2.0 * dot_product * ny;
+                ball_state.dx = -ball_state.dx;
             }
 
             if ball_state.y + ball_state.dy >= self.height_f32 - 0.5
                 || ball_state.y + ball_state.dy < 0.5
             {
-                let nx = 0.0;
-                let ny = if ball_state.y + ball_state.dy >= self.height_f32 - 0.5 {
-                    -1.0
-                } else {
-                    1.0
-                };
-                let dot_product = ball_state.dx * nx + ball_state.dy * ny;
-                ball_state.dx = ball_state.dx - 2.0 * dot_product * nx;
-                ball_state.dy = ball_state.dy - 2.0 * dot_product * ny;
+                ball_state.dy = -ball_state.dy;
             }
 
             const CHECK_OFFSETS: [(f32, f32); 4] =
@@ -179,19 +179,9 @@ impl GameState {
                 let grid_y = check_y as usize;
 
                 if grid_x < self.width && grid_y < self.height {
-                    if self.squares[grid_x][grid_y] != ball_state.color_type {
-                        new_squares[grid_x][grid_y] = ball_state.color_type;
-
-                        match ball_state.color_type {
-                            SquareColor::Day => {
-                                day_score_delta += 1;
-                                night_score_delta -= 1;
-                            }
-                            SquareColor::Night => {
-                                night_score_delta += 1;
-                                day_score_delta -= 1;
-                            }
-                        }
+                    let idx = grid_x * self.height + grid_y;
+                    if self.squares[idx] != ball_state.color_type {
+                        self.back_buffer[idx] = ball_state.color_type;
 
                         let (nx, ny) = if offset_x.abs() > offset_y.abs() {
                             if offset_x > 0.0 {
@@ -209,17 +199,17 @@ impl GameState {
                         ball_state.dx = ball_state.dx - 2.0 * dot_product * nx;
                         ball_state.dy = ball_state.dy - 2.0 * dot_product * ny;
 
-                        let angle_randomness = self.rng.gen_range(-0.1..0.1);
-                        let speed = (ball_state.dx * ball_state.dx + ball_state.dy * ball_state.dy).sqrt();
-                        let angle = ball_state.dy.atan2(ball_state.dx) + angle_randomness;
-                        ball_state.dx = speed * angle.cos();
-                        ball_state.dy = speed * angle.sin();
+                        let r = self.rng.gen_range(-0.1..0.1);
+                        let old_dx = ball_state.dx;
+                        let old_dy = ball_state.dy;
+                        ball_state.dx = old_dx - old_dy * r;
+                        ball_state.dy = old_dx * r + old_dy;
                     }
                 }
             }
 
-            ball_state.x += ball_state.dx;
-            ball_state.y += ball_state.dy;
+            ball_state.x += ball_state.dx * speed_scale;
+            ball_state.y += ball_state.dy * speed_scale;
 
             ball_state.dx += self.rng.gen_range(-SPEED_RANDOMNESS..SPEED_RANDOMNESS);
             ball_state.dy += self.rng.gen_range(-SPEED_RANDOMNESS..SPEED_RANDOMNESS);
@@ -242,13 +232,9 @@ impl GameState {
                 };
             }
 
-            updated_balls[index] = ball_state;
+            self.balls[i] = ball_state;
         }
 
-        self.balls = updated_balls;
-        self.squares = new_squares;
-
-        self.day_score = (self.day_score as i32 + day_score_delta).max(0) as usize;
-        self.night_score = (self.night_score as i32 + night_score_delta).max(0) as usize;
+        std::mem::swap(&mut self.squares, &mut self.back_buffer);
     }
 }
